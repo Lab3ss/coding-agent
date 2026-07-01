@@ -27,7 +27,11 @@ import { resolve } from "node:path";
 // --- Load this instance's identity ---
 const scope = process.argv[2];
 const envFile = scope ? `.env.${scope}` : ".env";
-process.loadEnvFile(envFile);
+try {
+  process.loadEnvFile(envFile); // local dev: read .env.<scope>
+} catch {
+  // No env file (e.g. in a container) — env vars are injected directly by k8s.
+}
 
 const label = process.env.SCOPE_LABEL ?? scope ?? "default";
 const homeserver = process.env.MATRIX_HOMESERVER!;

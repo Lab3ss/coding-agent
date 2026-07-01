@@ -1,0 +1,13 @@
+.git
+node_modules
+.env
+.env.*
+!.env.example
+workspaces/
+workspaces-*/
+sessions/
+bot-state*.json
+usage-*.json
+registry-*.db
+registry-*.db-*
+*.log
