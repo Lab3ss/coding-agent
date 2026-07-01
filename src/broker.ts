@@ -193,12 +193,15 @@ Request: ${task}`;
 
   let finalText = "";
   let cost = 0;
-  try {
+
+  const attempt = async (resumeId?: string) => {
+    finalText = "";
+    cost = 0;
     for await (const msg of query({
       prompt,
       options: {
         cwd: p.workdir,
-        resume: p.sessionId,
+        resume: resumeId, // undefined => fresh session
         model, // e.g. claude-sonnet-4-6 to cut cost ~60% vs Opus; unset = Opus default
         // Safe tools run freely. Bash is NOT pre-allowed, so every shell command
         // routes through the gate, which allows it or asks for a phone tap.
@@ -219,8 +222,25 @@ Request: ${task}`;
         if (msg.subtype === "success") cost = msg.total_cost_usd;
       }
     }
+  };
+
+  try {
+    await attempt(p.sessionId);
   } catch (err: any) {
-    finalText = `⚠️ error: ${err?.message ?? err}`;
+    const m = err?.message ?? String(err);
+    // Stale/missing session (e.g. the transcript was on a previous pod): drop the
+    // saved id and start a fresh session instead of hard-failing the whole task.
+    if (p.sessionId && /No conversation found|session ID/i.test(m)) {
+      await client.sendText(roomId, "↻ previous session not found — starting a fresh one.");
+      p.sessionId = undefined;
+      try {
+        await attempt(undefined);
+      } catch (e2: any) {
+        finalText = `⚠️ error: ${e2?.message ?? e2}`;
+      }
+    } else {
+      finalText = `⚠️ error: ${m}`;
+    }
   }
   await client.sendText(roomId, finalText || "(no output)");
   return cost;
