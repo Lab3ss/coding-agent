@@ -205,6 +205,12 @@ Request: ${task}`;
         allowedTools: ["Read", "Edit", "Write", "Glob", "Grep"],
         canUseTool: makeGate(roomId),
         maxTurns: 40,
+        // The pod is our isolation boundary (non-root, no service-account token,
+        // scoped credentials), so we don't need Claude Code's extra bwrap/Seatbelt
+        // Bash sandbox — which isn't present in the slim Linux image and, if forced
+        // on, tends to break git/gh. Follow-up hardening: a k8s NetworkPolicy egress
+        // allowlist on the broker namespaces to bound where the agent can reach.
+        sandbox: { enabled: false },
       },
     })) {
       p.sessionId = (msg as any).session_id ?? p.sessionId;
