@@ -1,0 +1,15 @@
+{
+  "name": "matrix-broker",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Chat-driven autonomous Claude Code agent over Matrix (the 'broker').",
+  "main": "src/step1.ts",
+  "scripts": {
+    "step1": "node src/step1.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.195",
+    "matrix-bot-sdk": "^0.8.0"
+  }
+}
