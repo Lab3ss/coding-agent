@@ -1,4 +1,4 @@
-# Broker image — one image, run one instance per scope (arg: personal | pro | ...).
+# Coding-agent image — one image, run one instance per scope (arg: personal | pro | ...).
 # Config is injected as env vars (k8s Secret); no .env files or secrets are baked in.
 FROM node:22-bookworm-slim
 

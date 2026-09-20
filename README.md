@@ -1,4 +1,4 @@
-# matrix-broker
+# coding-agent
 
 Drive an autonomous Claude Code agent from a chat app (Matrix) — from your phone,
 anywhere. **One room = one project = one repo = one durable Claude session.** The
@@ -54,12 +54,12 @@ CLI, `git`, and `gh` on PATH.
 ## Deployment
 
 Runs in production on a K3s cluster, managed by Flux (GitOps), one Deployment per
-scope. The image is `ghcr.io/lab3ss/matrix-broker` (built `linux/amd64`). All the
+scope. The image is `ghcr.io/lab3ss/coding-agent` (built `linux/amd64`). All the
 Kubernetes manifests, SOPS-encrypted secrets, and operational notes live in the
 GitOps repo:
 
-- **`Lab3ss/k3s-gitops`** → `apps/matrix-broker/` (manifests) and
-  **`docs/matrix-broker.md`** (deployment, day-2 ops, rebuild, open items —
+- **`Lab3ss/k3s-gitops`** → `apps/coding-agent/` (manifests) and
+  **`docs/coding-agent.md`** (deployment, day-2 ops, rebuild, open items —
   **start there when resuming work**).
 
 Shipping a code change: rebuild + push the image for `linux/amd64`, bump the tag
