@@ -34,6 +34,13 @@ sending prompts, and relaying `opencode`'s own permission/approval prompts
    file) — the next message re-provisions without re-asking, but starts a
    **fresh** `opencode` session (no PVC, so no conversation memory survives
    a teardown).
+5. `/connect` (once a room's pod is up) replies with the exact
+   `kubectl port-forward` + `opencode attach` commands to drive that same
+   session from a local `opencode` TUI — useful for starting on your phone
+   via Matrix, then switching to hands-on at a laptop with cluster access, and
+   back. VPN/cluster-network only by design (the room's opencode server has no
+   public exposure — see "Encryption" for the same reasoning applied to
+   network access instead of transport encryption).
 
 ## Config (env vars on the broker)
 

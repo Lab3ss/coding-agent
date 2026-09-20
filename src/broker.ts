@@ -161,6 +161,28 @@ client.on("room.message", async (roomId: string, event: any) => {
     return;
   }
 
+  if (/^\/connect\b/i.test(body)) {
+    const room = getRoom(roomId);
+    if (!room?.podName) {
+      await client.sendText(roomId, "Nothing running here yet — send a message first to provision the workspace.");
+      return;
+    }
+    let password = serverPasswords.get(roomId);
+    if (!password) {
+      password = await getRoomServerPassword(room.podName);
+      serverPasswords.set(roomId, password);
+    }
+    await client.sendText(
+      roomId,
+      "VPN/cluster access only — this never leaves the private network. From a machine with " +
+        `kubectl access:\n\nkubectl port-forward -n coding-agent-rooms svc/${room.podName} 4096:4096\n` +
+        `opencode attach http://localhost:4096 -p ${password}\n\n` +
+        "Keep the port-forward running in one terminal, attach in another. Works alongside chatting " +
+        "here — alternate freely, same session either way.",
+    );
+    return;
+  }
+
   if (busyRooms.has(roomId)) {
     await client.sendText(roomId, "Still working on the previous request — one moment.");
     return;
