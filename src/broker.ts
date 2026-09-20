@@ -183,6 +183,25 @@ client.on("room.message", async (roomId: string, event: any) => {
     return;
   }
 
+  if (/^\/model\b/i.test(body)) {
+    const room = getRoom(roomId);
+    const arg = body.replace(/^\/model\s*/i, "").trim();
+    if (!arg) {
+      await client.sendText(roomId, room?.model ? `Current model: ${room.model}` : "No model set yet.");
+      return;
+    }
+    if (!room) {
+      await client.sendText(roomId, "No project set up in this room yet — send a repo first.");
+      return;
+    }
+    room.model = arg;
+    saveRoom(room);
+    // model is sent per-message (src/opencode.ts), never baked into the pod,
+    // so this takes effect on the very next message — no restart needed.
+    await client.sendText(roomId, `Model set to ${arg}. Takes effect on your next message.`);
+    return;
+  }
+
   if (busyRooms.has(roomId)) {
     await client.sendText(roomId, "Still working on the previous request — one moment.");
     return;

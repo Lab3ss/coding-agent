@@ -41,6 +41,13 @@ sending prompts, and relaying `opencode`'s own permission/approval prompts
    back. VPN/cluster-network only by design (the room's opencode server has no
    public exposure — see "Encryption" for the same reasoning applied to
    network access instead of transport encryption).
+6. `/model <id>` changes the room's model (any OpenRouter model id — check
+   [openrouter.ai/models](https://openrouter.ai/models) for the exact slug).
+   Takes effect on your very next message, no pod restart — the model is
+   sent per-message, never baked into the pod. `/model` with no argument
+   shows the current one. Useful if onboarding was given an invalid model id
+   (`/stop` alone does **not** fix this — it only tears down the pod, the
+   remembered model is unchanged).
 
 ## Config (env vars on the broker)
 
