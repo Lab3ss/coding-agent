@@ -23,11 +23,6 @@ export function roomResourceName(roomId: string): string {
 
 export type RoomEnv = { repo: string; token: string; openrouterKey: string };
 
-/** Random Basic-Auth password opencode's server uses to gate its own API. */
-export function newServerPassword(): string {
-  return crypto.randomBytes(16).toString("hex");
-}
-
 async function ignoringConflict(fn: () => Promise<unknown>): Promise<void> {
   try {
     await fn();
@@ -40,8 +35,20 @@ async function ignoringConflict(fn: () => Promise<unknown>): Promise<void> {
  * Idempotent: safe to call again after a partial failure (e.g. the Secret
  * and Pod got created but the readiness wait then failed) — already-existing
  * resources are left as-is rather than erroring on "already exists".
+ *
+ * Returns the room's actual OPENCODE_SERVER_PASSWORD, read back from the
+ * Secret rather than trusting a freshly-generated one — if the Secret
+ * already existed (idempotent create skipped it), the running pod still has
+ * whatever password was baked in on its FIRST creation, so generating a new
+ * one here and using that for auth would silently mismatch (401).
  */
-export async function provisionRoom(name: string, env: RoomEnv, serverPassword: string): Promise<void> {
+/** Reads back the room's actual OPENCODE_SERVER_PASSWORD from its live Secret. */
+export async function getRoomServerPassword(name: string): Promise<string> {
+  const secret = await core.readNamespacedSecret({ name, namespace: ROOMS_NS });
+  return Buffer.from(secret.data!.OPENCODE_SERVER_PASSWORD, "base64").toString("utf8");
+}
+
+export async function provisionRoom(name: string, env: RoomEnv): Promise<string> {
   await ignoringConflict(() =>
     core.createNamespacedSecret({
       namespace: ROOMS_NS,
@@ -50,12 +57,13 @@ export async function provisionRoom(name: string, env: RoomEnv, serverPassword: 
         stringData: {
           REPO: env.repo,
           GH_TOKEN: env.token,
-          OPENCODE_SERVER_PASSWORD: serverPassword,
+          OPENCODE_SERVER_PASSWORD: crypto.randomBytes(16).toString("hex"),
           OPENROUTER_API_KEY: env.openrouterKey,
         },
       },
     }),
   );
+  const serverPassword = await getRoomServerPassword(name);
 
   await ignoringConflict(() =>
     core.createNamespacedPod({
@@ -92,6 +100,8 @@ export async function provisionRoom(name: string, env: RoomEnv, serverPassword: 
       },
     }),
   );
+
+  return serverPassword;
 }
 
 /** In-cluster base URL for a room's opencode server (stable even if the pod restarts). */

@@ -18,7 +18,7 @@
  */
 import { MatrixClient, SimpleFsStorageProvider, AutojoinRoomsMixin } from "matrix-bot-sdk";
 import { getRoom, newRoom, saveRoom, touch, idleRooms, type Room } from "./registry.ts";
-import { provisionRoom, teardownRoom, roomResourceName, roomServerUrl, waitForRunning, newServerPassword } from "./k8s.ts";
+import { provisionRoom, teardownRoom, roomResourceName, roomServerUrl, waitForRunning, getRoomServerPassword } from "./k8s.ts";
 import { createSession, sendMessage, respondPermission, watchPermissions } from "./opencode.ts";
 
 const homeserver = process.env.MATRIX_HOMESERVER!;
@@ -80,12 +80,22 @@ function stopPermissionWatcher(roomId: string) {
   serverPasswords.delete(roomId);
 }
 
-/** No-op if already provisioned; re-provisions (fresh session) if idle-torn-down. */
+/**
+ * No-op if already provisioned; re-provisions (fresh session) if idle-torn-down.
+ * If the pod is already live but the broker restarted since (losing its
+ * in-memory serverPasswords/permissionWatchers), recovers the password from
+ * the Secret and restarts the watcher rather than assuming they're set.
+ */
 async function ensureProvisioned(room: Room): Promise<void> {
-  if (room.podName) return;
+  if (room.podName) {
+    if (!serverPasswords.has(room.roomId)) {
+      serverPasswords.set(room.roomId, await getRoomServerPassword(room.podName));
+    }
+    await startPermissionWatcher(room);
+    return;
+  }
   const name = roomResourceName(room.roomId);
-  const password = newServerPassword();
-  await provisionRoom(name, { repo: room.repo!, token: room.token!, openrouterKey }, password);
+  const password = await provisionRoom(name, { repo: room.repo!, token: room.token!, openrouterKey });
   serverPasswords.set(room.roomId, password);
   await waitForRunning(name);
   const baseUrl = roomServerUrl(name);
