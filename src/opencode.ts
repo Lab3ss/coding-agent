@@ -32,7 +32,11 @@ export async function sendMessage(
   model?: string,
 ): Promise<string> {
   const body: Record<string, unknown> = { parts: [{ type: "text", text }] };
-  if (model) body.model = model;
+  // The API wants { providerID, modelID }, not a bare string. Every room only
+  // has an OPENROUTER_API_KEY, so the provider is always "openrouter"; the
+  // user-supplied model (e.g. "google/gemini-3.8-flash:batch") is the modelID
+  // OpenRouter itself expects.
+  if (model) body.model = { providerID: "openrouter", modelID: model };
   const res = await req<{ parts: Array<{ type: string; text?: string }> }>(
     baseUrl,
     password,
