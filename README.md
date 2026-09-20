@@ -57,6 +57,18 @@ sending prompts, and relaying `opencode`'s own permission/approval prompts
 - **Approval gate** — `opencode`'s own permission prompts (shell commands,
   `git push`, etc.) pause and ask in the room before running. No timeout — it
   waits as long as it takes.
+- **Token redacted after read** — the PAT message is redacted from room
+  history right after the broker reads it (best-effort — not a substitute for
+  room encryption; see "Encryption" below).
+
+## Encryption
+
+Rooms are onboarded **unencrypted** — `matrix-bot-sdk` here has no E2EE
+crypto provider wired in, so it can't decrypt messages in an encrypted room.
+Turn off encryption when creating/inviting the bot to a room. Redacting the
+PAT message (above) reduces plaintext exposure in room history but doesn't
+replace transport encryption; see the GitOps repo's `docs/coding-agent.md`
+for the fuller tradeoff discussion.
 
 ## Requirements
 

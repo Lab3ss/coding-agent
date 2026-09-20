@@ -182,7 +182,14 @@ client.on("room.message", async (roomId: string, event: any) => {
     room.token = body;
     room.onboarding = "model";
     saveRoom(room);
-    await client.sendText(roomId, "Which model? (any OpenRouter model id, e.g. `anthropic/claude-sonnet-4.5` — see openrouter.ai/models)");
+    // Best-effort: strip the PAT out of room history right after reading it.
+    // Not a security boundary (the homeserver may retain it briefly, and
+    // redaction can't reach anywhere the room already federated), just
+    // closes the main practical exposure — nobody scrolling back sees it.
+    await client.redactEvent(roomId, event.event_id, "token removed from history").catch((err) =>
+      console.warn(`[${roomId}] failed to redact token message:`, err?.message ?? err),
+    );
+    await client.sendText(roomId, "Got it (and removed that message from the room history). Which model? (any OpenRouter model id, e.g. `anthropic/claude-sonnet-4.5` — see openrouter.ai/models)");
     return;
   }
 
