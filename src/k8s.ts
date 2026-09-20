@@ -28,51 +28,70 @@ export function newServerPassword(): string {
   return crypto.randomBytes(16).toString("hex");
 }
 
+async function ignoringConflict(fn: () => Promise<unknown>): Promise<void> {
+  try {
+    await fn();
+  } catch (err: any) {
+    if (err?.code !== 409) throw err;
+  }
+}
+
+/**
+ * Idempotent: safe to call again after a partial failure (e.g. the Secret
+ * and Pod got created but the readiness wait then failed) — already-existing
+ * resources are left as-is rather than erroring on "already exists".
+ */
 export async function provisionRoom(name: string, env: RoomEnv, serverPassword: string): Promise<void> {
-  await core.createNamespacedSecret({
-    namespace: ROOMS_NS,
-    body: {
-      metadata: { name },
-      stringData: {
-        REPO: env.repo,
-        GH_TOKEN: env.token,
-        OPENCODE_SERVER_PASSWORD: serverPassword,
-        OPENROUTER_API_KEY: env.openrouterKey,
+  await ignoringConflict(() =>
+    core.createNamespacedSecret({
+      namespace: ROOMS_NS,
+      body: {
+        metadata: { name },
+        stringData: {
+          REPO: env.repo,
+          GH_TOKEN: env.token,
+          OPENCODE_SERVER_PASSWORD: serverPassword,
+          OPENROUTER_API_KEY: env.openrouterKey,
+        },
       },
-    },
-  });
+    }),
+  );
 
-  await core.createNamespacedPod({
-    namespace: ROOMS_NS,
-    body: {
-      metadata: { name, labels: { app: "coding-agent-room", room: name } },
-      spec: {
-        automountServiceAccountToken: false,
-        restartPolicy: "Never",
-        securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000 },
-        containers: [
-          {
-            name: "runner",
-            image: RUNNER_IMAGE,
-            envFrom: [{ secretRef: { name } }],
-            ports: [{ name: "http", containerPort: OPENCODE_PORT }],
-            resources: {
-              requests: { cpu: "250m", memory: "512Mi" },
-              limits: { cpu: "2", memory: "2Gi" },
+  await ignoringConflict(() =>
+    core.createNamespacedPod({
+      namespace: ROOMS_NS,
+      body: {
+        metadata: { name, labels: { app: "coding-agent-room", room: name } },
+        spec: {
+          automountServiceAccountToken: false,
+          restartPolicy: "Never",
+          securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000 },
+          containers: [
+            {
+              name: "runner",
+              image: RUNNER_IMAGE,
+              envFrom: [{ secretRef: { name } }],
+              ports: [{ name: "http", containerPort: OPENCODE_PORT }],
+              resources: {
+                requests: { cpu: "250m", memory: "512Mi" },
+                limits: { cpu: "2", memory: "2Gi" },
+              },
             },
-          },
-        ],
+          ],
+        },
       },
-    },
-  });
+    }),
+  );
 
-  await core.createNamespacedService({
-    namespace: ROOMS_NS,
-    body: {
-      metadata: { name },
-      spec: { selector: { room: name }, ports: [{ name: "http", port: OPENCODE_PORT, targetPort: OPENCODE_PORT }] },
-    },
-  });
+  await ignoringConflict(() =>
+    core.createNamespacedService({
+      namespace: ROOMS_NS,
+      body: {
+        metadata: { name },
+        spec: { selector: { room: name }, ports: [{ name: "http", port: OPENCODE_PORT, targetPort: OPENCODE_PORT }] },
+      },
+    }),
+  );
 }
 
 /** In-cluster base URL for a room's opencode server (stable even if the pod restarts). */
@@ -94,11 +113,16 @@ export async function teardownRoom(name: string): Promise<void> {
   await ignoring404(() => core.deleteNamespacedSecret({ name, namespace: ROOMS_NS }));
 }
 
-/** Poll until the pod's container is Running (not just Pending/ContainerCreating). */
+/**
+ * Poll until the pod's container is Running (not just Pending/ContainerCreating).
+ * Uses a plain GET on the pod (already covered by the Role's "pods" grant) —
+ * its .status field is included on read; only *writing* status needs the
+ * separate pods/status subresource permission, which the broker doesn't need.
+ */
 export async function waitForRunning(name: string, timeoutMs = 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const pod = await core.readNamespacedPodStatus({ name, namespace: ROOMS_NS });
+    const pod = await core.readNamespacedPod({ name, namespace: ROOMS_NS });
     const running = pod.status?.containerStatuses?.some((c) => c.state?.running);
     if (running) return;
     if (pod.status?.phase === "Failed") throw new Error(`room pod ${name} failed to start`);
