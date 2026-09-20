@@ -186,10 +186,22 @@ client.on("room.message", async (roomId: string, event: any) => {
     // Not a security boundary (the homeserver may retain it briefly, and
     // redaction can't reach anywhere the room already federated), just
     // closes the main practical exposure — nobody scrolling back sees it.
-    await client.redactEvent(roomId, event.event_id, "token removed from history").catch((err) =>
-      console.warn(`[${roomId}] failed to redact token message:`, err?.message ?? err),
+    // Redacting someone else's event (the human's own message) needs
+    // moderator+ power level in the room — report honestly if we don't have it
+    // rather than claiming success either way.
+    const redacted = await client
+      .redactEvent(roomId, event.event_id, "token removed from history")
+      .then(() => true)
+      .catch((err) => {
+        console.warn(`[${roomId}] failed to redact token message:`, err?.message ?? err);
+        return false;
+      });
+    await client.sendText(
+      roomId,
+      redacted
+        ? "Got it (and removed that message from the room history). Which model? (any OpenRouter model id, e.g. `anthropic/claude-sonnet-4.5` — see openrouter.ai/models)"
+        : "Got it. ⚠️ I couldn't remove that message from history (I need moderator power level in this room to redact it) — make me a moderator if you want that. Which model? (any OpenRouter model id, e.g. `anthropic/claude-sonnet-4.5` — see openrouter.ai/models)",
     );
-    await client.sendText(roomId, "Got it (and removed that message from the room history). Which model? (any OpenRouter model id, e.g. `anthropic/claude-sonnet-4.5` — see openrouter.ai/models)");
     return;
   }
 
