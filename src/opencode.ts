@@ -4,6 +4,14 @@
  * nothing else in the coding-agent-rooms namespace can reach another room's
  * server even over the cluster network.
  */
+import { Agent } from "undici";
+
+// Node's global fetch defaults to a 5-minute socket timeout (undici's
+// Agent default headersTimeout/bodyTimeout), which a real multi-step coding
+// task (many tool calls, edits, test runs on /session/:id/message, a single
+// blocking request for the whole turn) can easily exceed — surfaces as a
+// generic "fetch failed" with no useful detail. 30 minutes per request.
+const longRunningDispatcher = new Agent({ headersTimeout: 1_800_000, bodyTimeout: 1_800_000 });
 
 function authHeader(password: string): string {
   return "Basic " + Buffer.from(`opencode:${password}`).toString("base64");
@@ -13,7 +21,8 @@ async function req<T>(baseUrl: string, password: string, path: string, init?: Re
   const res = await fetch(baseUrl + path, {
     ...init,
     headers: { "content-type": "application/json", authorization: authHeader(password), ...(init?.headers ?? {}) },
-  });
+    dispatcher: longRunningDispatcher,
+  } as RequestInit);
   if (!res.ok) throw new Error(`opencode ${path} -> ${res.status} ${await res.text().catch(() => "")}`);
   return res.status === 204 ? (undefined as T) : ((await res.json()) as T);
 }
@@ -87,7 +96,8 @@ export async function watchPermissions(
       const res = await fetch(baseUrl + "/global/event", {
         headers: { authorization: authHeader(password) },
         signal: controller.signal,
-      });
+        dispatcher: longRunningDispatcher,
+      } as RequestInit);
       if (!res.ok || !res.body) throw new Error(`/global/event -> ${res.status}`);
       const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
       let buf = "";
