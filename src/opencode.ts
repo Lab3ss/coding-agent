@@ -1,0 +1,120 @@
+/**
+ * HTTP client for one room's `opencode serve` instance (see runner/entrypoint.sh).
+ * Basic-auth protected with a per-room random password (see src/k8s.ts) so
+ * nothing else in the coding-agent-rooms namespace can reach another room's
+ * server even over the cluster network.
+ */
+
+function authHeader(password: string): string {
+  return "Basic " + Buffer.from(`opencode:${password}`).toString("base64");
+}
+
+async function req<T>(baseUrl: string, password: string, path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(baseUrl + path, {
+    ...init,
+    headers: { "content-type": "application/json", authorization: authHeader(password), ...(init?.headers ?? {}) },
+  });
+  if (!res.ok) throw new Error(`opencode ${path} -> ${res.status} ${await res.text().catch(() => "")}`);
+  return res.status === 204 ? (undefined as T) : ((await res.json()) as T);
+}
+
+export async function createSession(baseUrl: string, password: string): Promise<string> {
+  const session = await req<{ id: string }>(baseUrl, password, "/session", { method: "POST", body: "{}" });
+  return session.id;
+}
+
+/** Sends a prompt, waits for the full reply, returns its plain-text concatenation. */
+export async function sendMessage(
+  baseUrl: string,
+  password: string,
+  sessionId: string,
+  text: string,
+  model?: string,
+): Promise<string> {
+  const body: Record<string, unknown> = { parts: [{ type: "text", text }] };
+  if (model) body.model = model;
+  const res = await req<{ parts: Array<{ type: string; text?: string }> }>(
+    baseUrl,
+    password,
+    `/session/${sessionId}/message`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+  return res.parts
+    .filter((p) => p.type === "text" && p.text)
+    .map((p) => p.text)
+    .join("\n")
+    .trim();
+}
+
+export async function respondPermission(
+  baseUrl: string,
+  password: string,
+  sessionId: string,
+  permissionId: string,
+  approved: boolean,
+): Promise<void> {
+  await req(baseUrl, password, `/session/${sessionId}/permissions/${permissionId}`, {
+    method: "POST",
+    body: JSON.stringify({ response: approved ? "allow" : "deny" }),
+  });
+}
+
+export type PermissionRequest = { sessionId: string; permissionId: string; description: string };
+
+/**
+ * Opens the room's SSE event stream and calls `onPermission` for each
+ * permission-request event.
+ *
+ * ponytail: the exact event field names below (`type`, `properties.sessionID`,
+ * `.permissionID`, `.title`/`.description`) are a best guess from opencode's
+ * docs, not confirmed against real traffic — unmatched events are logged raw
+ * so the first live approval-gate test makes any mismatch obvious and cheap
+ * to fix in this one function.
+ */
+export async function watchPermissions(
+  baseUrl: string,
+  password: string,
+  onPermission: (req: PermissionRequest) => void,
+  onError: (err: unknown) => void,
+): Promise<() => void> {
+  const controller = new AbortController();
+  (async () => {
+    try {
+      const res = await fetch(baseUrl + "/global/event", {
+        headers: { authorization: authHeader(password) },
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`/global/event -> ${res.status}`);
+      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += value;
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const chunk = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const line = chunk.split("\n").find((l) => l.startsWith("data:"));
+          if (!line) continue;
+          try {
+            const evt = JSON.parse(line.slice(5).trim());
+            const props = evt.properties ?? evt;
+            if (evt.type?.includes("permission") && props.permissionID) {
+              onPermission({
+                sessionId: props.sessionID,
+                permissionId: props.permissionID,
+                description: props.title ?? props.description ?? JSON.stringify(props).slice(0, 200),
+              });
+            }
+          } catch {
+            // Not JSON or not a shape we recognize — ignore rather than crash the watcher.
+          }
+        }
+      }
+    } catch (err) {
+      if (!controller.signal.aborted) onError(err);
+    }
+  })();
+  return () => controller.abort();
+}

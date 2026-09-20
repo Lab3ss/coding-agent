@@ -3,13 +3,13 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Chat-driven autonomous Claude Code agent over Matrix.",
-  "main": "src/step1.ts",
+  "description": "Chat-driven autonomous coding agent over Matrix — provisions an isolated opencode-backed pod per room.",
+  "main": "src/broker.ts",
   "scripts": {
-    "step1": "node src/step1.ts"
+    "broker": "node src/broker.ts"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.195",
+    "@kubernetes/client-node": "^2.0.0",
     "matrix-bot-sdk": "^0.8.0"
   }
 }

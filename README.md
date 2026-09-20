@@ -1,66 +1,88 @@
 # coding-agent
 
-Drive an autonomous Claude Code agent from a chat app (Matrix) — from your phone,
-anywhere. **One room = one project = one repo = one durable Claude session.** The
-agent clones, codes, commits, and opens PRs; you review the PRs from GitHub mobile.
+Drive an autonomous coding agent from a chat app (Matrix) — from your phone,
+anywhere. **One room = one project.** Invite the bot, tell it a repo, a GitHub
+token, and a model — it clones the repo into its own isolated pod, codes,
+commits, and opens PRs; you review the PRs from GitHub mobile.
 
 ## How it works
 
-One scope-agnostic broker process. You run **one instance per scope** (identity),
-each with its own credentials, so a personal instance can never touch a
-professional repo — the wall is the credential it holds, not a rule.
+Two pieces:
 
-```
-node src/broker.ts personal   # loads .env.personal
-node src/broker.ts pro        # loads .env.pro
-```
+- **The broker** (`src/broker.ts`) — a single, always-on, global bot. It holds
+  no repo credentials of its own — only a Matrix account and an OpenRouter
+  key. When invited to a new room, it asks for a repo, a GitHub PAT scoped to
+  that repo, and a model (any OpenRouter model id), then provisions an
+  isolated pod for that room via the Kubernetes API (`src/k8s.ts`).
+- **The runner** (`runner/`) — a minimal, throwaway image. On start it clones
+  the room's repo with the room's PAT and runs a headless `opencode serve`.
+  No persistent storage: a fresh pod means a fresh clone and a fresh
+  `opencode` session.
 
-Per scope you provide (in `.env.<scope>`, gitignored — see `.env.example`):
-
-| Var | Purpose |
-|-----|---------|
-| `MATRIX_HOMESERVER`, `MATRIX_TOKEN` | this scope's dedicated bot account |
-| `GH_TOKEN` | fine-grained PAT scoped to ONLY this scope's repos (the isolation wall) |
-| `ANTHROPIC_API_KEY` | this scope's Anthropic key (per-scope billing); blank = local CLI login |
-| `GIT_USER_NAME`, `GIT_USER_EMAIL` | commit identity for this scope |
-| `WORKSPACE_ROOT` | where this scope's clones live (never shared) |
-| `DAILY_USD_LIMIT` | max spend per project per day; `0`/blank = unlimited |
-| `MODEL` | e.g. `claude-sonnet-4-6` (cheaper); blank = Opus default |
-| `SCOPE_LABEL` | label for logs |
+The broker talks to each room's runner over HTTP (`src/opencode.ts`):
+sending prompts, and relaying `opencode`'s own permission/approval prompts
+(e.g. before `git push`) back into the room as a yes/no question.
 
 ## Usage
 
-1. Invite the scope's bot to a Matrix room.
-2. Send a repo (`owner/name`) to onboard it — the broker clones it.
+1. Invite the bot to a Matrix room.
+2. Answer its three onboarding questions: repo, GitHub PAT, model.
 3. Send tasks in plain language. The agent works and reports back.
+4. `/stop` tears the room's pod down on demand. Idle rooms (default 24h, see
+   `IDLE_TEARDOWN_HOURS`) tear down automatically. Either way the room's
+   repo/token/model are remembered (`src/registry.ts`, a persistent SQLite
+   file) — the next message re-provisions without re-asking, but starts a
+   **fresh** `opencode` session (no PVC, so no conversation memory survives
+   a teardown).
 
-State (project → repo/session mapping) persists in a per-scope SQLite registry, so
-restarts resume where you left off.
+## Config (env vars on the broker)
+
+| Var | Purpose |
+|-----|---------|
+| `MATRIX_HOMESERVER`, `MATRIX_TOKEN` | the bot's Matrix account |
+| `OPENROUTER_API_KEY` | the only LLM credential — copied into every room's pod at provision time |
+| `ROOMS_NAMESPACE` | where per-room pods live; default `coding-agent-rooms` |
+| `RUNNER_IMAGE` | the runner image tag to provision; default `ghcr.io/lab3ss/coding-agent-runner:0.1.0` |
+| `IDLE_TEARDOWN_HOURS` | idle threshold before auto-teardown; default `24` |
 
 ## Safety
 
-- **Credential isolation** — each instance holds only its own PAT; scoped so it
-  can't reach another scope's repos.
-- **Approval gate** — `git push`, `gh pr create`/`merge`, and destructive shell
-  (`rm -rf`, `git reset --hard`, `git clean -f`, `sudo`) pause and ask for approval
-  in the room before running. No timeout — it waits as long as it takes.
-- **Cost cap** — per-project daily USD limit.
+- **No standing repo access** — the broker holds nothing that can reach a
+  GitHub repo; each room's PAT lives only in that room's Secret, inside that
+  room's own pod, deleted on teardown.
+- **Untrusted-workload boundary** — runner pods are non-root, have no
+  Kubernetes API access (`automountServiceAccountToken: false`), and run in a
+  dedicated namespace the broker can create/delete Pods/Secrets/Services in
+  and nothing else can reach.
+- **Approval gate** — `opencode`'s own permission prompts (shell commands,
+  `git push`, etc.) pause and ask in the room before running. No timeout — it
+  waits as long as it takes.
 
 ## Requirements
 
-Node 22+ (uses built-in `node:sqlite` and `process.loadEnvFile`), the `claude`
-CLI, `git`, and `gh` on PATH.
+Node 22+ (native TypeScript execution, no build step; uses built-in
+`node:sqlite`). The broker needs in-cluster Kubernetes API access
+(`@kubernetes/client-node`, auto-configured via the pod's ServiceAccount — see
+the GitOps repo's RBAC). The runner needs `git` and `opencode-ai` on PATH
+(baked into its image).
 
 ## Deployment
 
-Runs in production on a K3s cluster, managed by Flux (GitOps), one Deployment per
-scope. The image is `ghcr.io/lab3ss/coding-agent` (built `linux/amd64`). All the
-Kubernetes manifests, SOPS-encrypted secrets, and operational notes live in the
-GitOps repo:
+Runs in production on a K3s cluster, managed by Flux (GitOps): one broker
+Deployment plus dynamically-created per-room Pods/Secrets/Services. Two
+images, both `linux/amd64`:
 
-- **`Lab3ss/k3s-gitops`** → `apps/coding-agent/` (manifests) and
-  **`docs/coding-agent.md`** (deployment, day-2 ops, rebuild, open items —
-  **start there when resuming work**).
+- `ghcr.io/lab3ss/coding-agent` — the broker (this repo's `Dockerfile`).
+- `ghcr.io/lab3ss/coding-agent-runner` — the runner (`runner/Dockerfile`).
 
-Shipping a code change: rebuild + push the image for `linux/amd64`, bump the tag
-in both deployments in the GitOps repo, commit, and reconcile.
+All Kubernetes manifests, SOPS-encrypted secrets, and operational notes live
+in the GitOps repo:
+
+- **`Lab3ss/k3s-gitops`** → `apps/coding-agent/` (broker + RBAC) and
+  `apps/coding-agent-rooms/` (namespace only — pods/secrets/services there are
+  created dynamically, not via GitOps) and **`docs/coding-agent.md`**
+  (deployment, day-2 ops, rebuild, open items — **start there when resuming
+  work**).
+
+Shipping a code change: rebuild + push whichever image changed for
+`linux/amd64`, bump its tag in the GitOps repo, commit, and reconcile.
