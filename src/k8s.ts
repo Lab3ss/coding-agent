@@ -16,9 +16,22 @@ const ROOMS_NS = process.env.ROOMS_NAMESPACE ?? "coding-agent-rooms";
 const RUNNER_IMAGE = process.env.RUNNER_IMAGE ?? "ghcr.io/lab3ss/coding-agent-runner:0.1.0";
 const OPENCODE_PORT = 4096;
 
-/** Deterministic, DNS-safe (<=63 char) name for a room's Pod/Secret/Service. */
-export function roomResourceName(roomId: string): string {
-  return `room-${crypto.createHash("sha1").update(roomId).digest("hex").slice(0, 16)}`;
+/**
+ * DNS-safe (<=63 char) name for a room's Pod/Secret/Service: a kebab-cased
+ * slug of the room's display name (if any), plus the roomId hash so it stays
+ * unique even if two rooms share a name. The slug is purely cosmetic — for
+ * `kubectl logs`/`get pod` by eye — so it's computed once at provision time
+ * and stored on the Room; a later room rename doesn't change it.
+ */
+export function roomResourceName(roomId: string, roomName?: string): string {
+  const hash = crypto.createHash("sha1").update(roomId).digest("hex").slice(0, 16);
+  const slug = (roomName ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 63 - "room-".length - 1 - hash.length)
+    .replace(/-+$/g, "");
+  return slug ? `room-${slug}-${hash}` : `room-${hash}`;
 }
 
 export type RoomEnv = { repo: string; token: string; openrouterKey: string };

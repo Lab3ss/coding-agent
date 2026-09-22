@@ -69,9 +69,27 @@ async function startPermissionWatcher(room: Room) {
         client.sendText(room.roomId, `⚠️ failed to record approval: ${err?.message ?? err}`),
       );
     },
+    (progress) => {
+      if (progress.sessionId !== room.sessionId) return;
+      console.log(`[${room.roomId}] 🔧 ${progress.title}`);
+      client.sendText(room.roomId, `🔧 ${progress.title}`).catch((err) =>
+        console.warn(`[${room.roomId}] failed to send progress:`, err?.message ?? err),
+      );
+    },
+    (sessErr) => {
+      if (sessErr.sessionId && sessErr.sessionId !== room.sessionId) return;
+      console.warn(`[${room.roomId}] session error:`, sessErr.message);
+      client.sendText(room.roomId, `⚠️ session error: ${sessErr.message}`).catch(() => {});
+    },
     (err) => console.warn(`[${room.roomId}] permission watcher error:`, err?.message ?? err),
   );
   permissionWatchers.set(room.roomId, stop);
+}
+
+/** Logs to the broker's own container output and posts the same line to the room. */
+async function announce(room: Room, text: string): Promise<void> {
+  console.log(`[${room.roomId}] ${text}`);
+  await client.sendText(room.roomId, text);
 }
 
 function stopPermissionWatcher(roomId: string) {
@@ -94,10 +112,17 @@ async function ensureProvisioned(room: Room): Promise<void> {
     await startPermissionWatcher(room);
     return;
   }
-  const name = roomResourceName(room.roomId);
+  const roomName = await client.getRoomStateEvent(room.roomId, "m.room.name", "").then(
+    (s) => s?.name as string | undefined,
+    () => undefined,
+  );
+  const name = roomResourceName(room.roomId, roomName);
+  await announce(room, "📦 creating pod…");
   const password = await provisionRoom(name, { repo: room.repo!, token: room.token!, openrouterKey });
   serverPasswords.set(room.roomId, password);
+  await announce(room, "⏳ waiting for pod to start (cloning repo)…");
   await waitForRunning(name);
+  await announce(room, "🔌 pod running, connecting to opencode server…");
   const baseUrl = roomServerUrl(name);
   const sessionId = await retryUntilReady(() => createSession(baseUrl, password));
   room.podName = name;
@@ -262,9 +287,9 @@ client.on("room.message", async (roomId: string, event: any) => {
     saveRoom(room);
     busyRooms.add(roomId);
     try {
-      await client.sendText(roomId, `Setting up ${room.repo}…`);
+      await announce(room, `Setting up ${room.repo}…`);
       await ensureProvisioned(room);
-      await client.sendText(roomId, "✅ Ready. What would you like me to do?");
+      await announce(room, "✅ Ready. What would you like me to do?");
     } catch (err: any) {
       await client.sendText(roomId, `⚠️ setup failed: ${err?.message ?? err}`);
     } finally {
@@ -277,7 +302,7 @@ client.on("room.message", async (roomId: string, event: any) => {
   busyRooms.add(roomId);
   try {
     await ensureProvisioned(room); // transparently re-provisions if idle-torn-down
-    await client.sendText(roomId, "🛠️ on it…");
+    await announce(room, "🛠️ on it…");
     const password = serverPasswords.get(roomId)!;
     const baseUrl = roomServerUrl(room.podName!);
     const reply = await sendMessage(baseUrl, password, room.sessionId!, body, room.model);

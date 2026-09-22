@@ -5,7 +5,9 @@ set -eu
 : "${GH_TOKEN:?GH_TOKEN env var required}"
 
 WORKDIR=/home/node/workspace
+echo "[runner] cloning ${REPO}..."
 git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$WORKDIR"
 cd "$WORKDIR"
 
+echo "[runner] starting opencode server on port ${PORT:-4096}..."
 exec opencode serve --hostname 0.0.0.0 --port "${PORT:-4096}"

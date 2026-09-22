@@ -78,21 +78,27 @@ export async function respondPermission(
 }
 
 export type PermissionRequest = { sessionId: string; permissionId: string; description: string };
+export type ToolProgress = { sessionId: string; title: string };
+export type SessionError = { sessionId?: string; message: string };
 
 /**
- * Opens the room's SSE event stream and calls `onPermission` for each
- * permission-request event.
+ * Opens the room's SSE event stream and dispatches permission requests,
+ * per-tool-call progress (so a long turn isn't silent end-to-end), and
+ * session errors.
  *
  * ponytail: the exact event field names below (`type`, `properties.sessionID`,
- * `.permissionID`, `.title`/`.description`) are a best guess from opencode's
- * docs, not confirmed against real traffic — unmatched events are logged raw
- * so the first live approval-gate test makes any mismatch obvious and cheap
- * to fix in this one function.
+ * `.permissionID`, `.title`/`.description`, `message.part.updated`'s
+ * `properties.part.{type,tool,state}`) are a best guess from opencode's docs
+ * and SDK types, not confirmed against real traffic — unmatched events are
+ * logged raw so the first live run makes any mismatch obvious and cheap to
+ * fix in this one function.
  */
 export async function watchPermissions(
   baseUrl: string,
   password: string,
   onPermission: (req: PermissionRequest) => void,
+  onProgress: (progress: ToolProgress) => void,
+  onSessionError: (err: SessionError) => void,
   onError: (err: unknown) => void,
 ): Promise<() => void> {
   const controller = new AbortController();
@@ -125,6 +131,13 @@ export async function watchPermissions(
                 permissionId: props.permissionID,
                 description: props.title ?? props.description ?? JSON.stringify(props).slice(0, 200),
               });
+            } else if (evt.type === "message.part.updated" && props.part?.type === "tool" && props.part.state?.status === "running") {
+              onProgress({
+                sessionId: props.part.sessionID,
+                title: props.part.state.title ?? props.part.tool,
+              });
+            } else if (evt.type === "session.error") {
+              onSessionError({ sessionId: props.sessionID, message: JSON.stringify(props.error ?? props).slice(0, 200) });
             }
           } catch {
             // Not JSON or not a shape we recognize — ignore rather than crash the watcher.
