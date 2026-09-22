@@ -17,7 +17,10 @@ Two pieces:
 - **The runner** (`runner/`) — a minimal, throwaway image. On start it clones
   the room's repo with the room's PAT and runs a headless `opencode serve`.
   No persistent storage: a fresh pod means a fresh clone and a fresh
-  `opencode` session.
+  `opencode` session. The image bakes in opencode's global config
+  (`runner/opencode.json`) pointing at Matrix-specific agent rules
+  (`runner/opencode-rules.md`) — e.g. plain-text-only replies, since Matrix
+  clients don't render markdown.
 
 The broker talks to each room's runner over HTTP (`src/opencode.ts`):
 sending prompts, and relaying `opencode`'s own permission/approval prompts
