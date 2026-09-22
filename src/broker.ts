@@ -124,21 +124,27 @@ async function ensureProvisioned(room: Room): Promise<void> {
   await waitForRunning(name);
   await announce(room, "🔌 pod running, connecting to opencode server…");
   const baseUrl = roomServerUrl(name);
-  const sessionId = await retryUntilReady(() => createSession(baseUrl, password));
+  const sessionId = await retryUntilReady(() => createSession(baseUrl, password, AbortSignal.timeout(10_000)));
   room.podName = name;
   room.sessionId = sessionId;
   saveRoom(room);
   await startPermissionWatcher(room);
 }
 
-/** The container is Running before opencode's HTTP server inside it is actually listening. */
+/**
+ * The container is Running before opencode's HTTP server inside it is actually listening.
+ * Each attempt gets its own short-lived connection (callers pass a short AbortSignal timeout)
+ * so a single wedged TCP handshake (e.g. a stale conntrack entry) can't stall the whole retry
+ * loop — logged so `kubectl logs` shows why it's still "connecting" instead of nothing at all.
+ */
 async function retryUntilReady<T>(fn: () => Promise<T>, attempts = 10, delayMs = 2000): Promise<T> {
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
     try {
       return await fn();
-    } catch (err) {
+    } catch (err: any) {
       lastErr = err;
+      console.warn(`[retryUntilReady] attempt ${i + 1}/${attempts} failed:`, err?.message ?? err);
       await new Promise((r) => setTimeout(r, delayMs));
     }
   }
@@ -300,14 +306,23 @@ client.on("room.message", async (roomId: string, event: any) => {
 
   // Steady state: repo/token/model all known.
   busyRooms.add(roomId);
+  let sentAt = Date.now();
   try {
     await ensureProvisioned(room); // transparently re-provisions if idle-torn-down
     await announce(room, "🛠️ on it…");
     const password = serverPasswords.get(roomId)!;
     const baseUrl = roomServerUrl(room.podName!);
+    sentAt = Date.now();
     const reply = await sendMessage(baseUrl, password, room.sessionId!, body, room.model);
     await client.sendText(roomId, reply || "(no output)");
   } catch (err: any) {
+    // Only console.log's own line has a timestamp (via `kubectl logs --timestamps`) and
+    // survives independently of Matrix — the error text sent to the room can get lost in
+    // scrollback. Logging the code + elapsed time here is what lets a future 30-min turn
+    // timeout be told apart from a genuine long task cut short vs. a stall: cross-reference
+    // against the last "🔧 ..." tool-progress line for this room to see whether opencode was
+    // still actively working right up to the cutoff, or had gone silent well before it.
+    console.error(`[${roomId}] sendMessage failed after ${Date.now() - sentAt}ms (code=${err?.code ?? "?"}): ${err?.message ?? err}`);
     await client.sendText(roomId, `⚠️ ${err?.message ?? err}`);
   } finally {
     busyRooms.delete(roomId);

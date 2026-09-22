@@ -16,24 +16,40 @@ import { Agent, fetch as undiciFetch } from "undici";
 // fails that check immediately (UND_ERR_INVALID_ARG), before ever making a
 // request. Using undici's own `fetch` export here (paired with an Agent
 // from that same package instance) avoids the cross-instance mismatch.
-const longRunningDispatcher = new Agent({ headersTimeout: 1_800_000, bodyTimeout: 1_800_000 });
+// connectTimeout is separate from headersTimeout/bodyTimeout — it only bounds the TCP
+// handshake, not the wait for opencode's response — so a stuck connection (e.g. a stale
+// conntrack entry routing the SYN into a black hole) fails fast and lets the caller retry
+// on a fresh socket, instead of silently tying up the 30-minute turn budget for nothing.
+const longRunningDispatcher = new Agent({ connectTimeout: 10_000, headersTimeout: 1_800_000, bodyTimeout: 1_800_000 });
 
 function authHeader(password: string): string {
   return "Basic " + Buffer.from(`opencode:${password}`).toString("base64");
 }
 
 async function req<T>(baseUrl: string, password: string, path: string, init?: RequestInit): Promise<T> {
-  const res = await undiciFetch(baseUrl + path, {
-    ...init,
-    headers: { "content-type": "application/json", authorization: authHeader(password), ...(init?.headers ?? {}) },
-    dispatcher: longRunningDispatcher,
-  } as Parameters<typeof undiciFetch>[1]);
+  const attempt = () =>
+    undiciFetch(baseUrl + path, {
+      ...init,
+      headers: { "content-type": "application/json", authorization: authHeader(password), ...(init?.headers ?? {}) },
+      dispatcher: longRunningDispatcher,
+    } as Parameters<typeof undiciFetch>[1]);
+  let res: Response;
+  try {
+    res = await attempt();
+  } catch (err: any) {
+    // A stuck TCP handshake (e.g. a stale conntrack entry) never reaches the server, so
+    // retrying once on a fresh connection is always safe here — unlike a timeout after the
+    // request was already sent, which might have side effects and must surface as an error.
+    if (err?.code !== "UND_ERR_CONNECT_TIMEOUT") throw err;
+    console.warn(`[opencode] connect timeout on ${path}, retrying once on a fresh connection`);
+    res = await attempt();
+  }
   if (!res.ok) throw new Error(`opencode ${path} -> ${res.status} ${await res.text().catch(() => "")}`);
   return res.status === 204 ? (undefined as T) : ((await res.json()) as T);
 }
 
-export async function createSession(baseUrl: string, password: string): Promise<string> {
-  const session = await req<{ id: string }>(baseUrl, password, "/session", { method: "POST", body: "{}" });
+export async function createSession(baseUrl: string, password: string, signal?: AbortSignal): Promise<string> {
+  const session = await req<{ id: string }>(baseUrl, password, "/session", { method: "POST", body: "{}", signal });
   return session.id;
 }
 
