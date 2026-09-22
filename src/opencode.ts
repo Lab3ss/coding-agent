@@ -53,6 +53,17 @@ export async function createSession(baseUrl: string, password: string, signal?: 
   return session.id;
 }
 
+/**
+ * Cheap, side-effect-free connectivity check. `sendMessage` can legitimately take up to the
+ * full 30-minute turn budget, so it can't carry a short AbortSignal itself — but a wedged TCP
+ * handshake (stale conntrack entry) looks identical to a slow real turn from the caller's
+ * side, so the only way to fail fast on the former without cutting off the latter is to probe
+ * first, on a bounded timeout, before committing to the long call.
+ */
+export async function probeConnection(baseUrl: string, password: string): Promise<void> {
+  await req(baseUrl, password, "/session/status", { signal: AbortSignal.timeout(10_000) });
+}
+
 /** Sends a prompt, waits for the full reply, returns its plain-text concatenation. */
 export async function sendMessage(
   baseUrl: string,

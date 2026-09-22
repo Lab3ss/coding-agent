@@ -19,7 +19,15 @@
 import { MatrixClient, SimpleFsStorageProvider, AutojoinRoomsMixin } from "matrix-bot-sdk";
 import { getRoom, newRoom, saveRoom, touch, idleRooms, type Room } from "./registry.ts";
 import { provisionRoom, teardownRoom, roomResourceName, roomServerUrl, waitForRunning, getRoomServerPassword } from "./k8s.ts";
-import { createSession, sendMessage, respondPermission, watchPermissions, getSessionUsage, type SessionUsage } from "./opencode.ts";
+import {
+  createSession,
+  sendMessage,
+  respondPermission,
+  watchPermissions,
+  getSessionUsage,
+  probeConnection,
+  type SessionUsage,
+} from "./opencode.ts";
 
 const COST_ALERT_STEP_USD = 5;
 
@@ -370,6 +378,10 @@ client.on("room.message", async (roomId: string, event: any) => {
     await announce(room, "🛠️ on it…");
     const password = serverPasswords.get(roomId)!;
     const baseUrl = roomServerUrl(room.podName!);
+    // Catches a wedged connection (same class of bug as the provisioning-time one) before
+    // committing to sendMessage's up-to-30-minute call, where it would otherwise be
+    // indistinguishable from a genuinely long turn.
+    await retryUntilReady(() => probeConnection(baseUrl, password));
     sentAt = Date.now();
     const reply = await sendMessage(baseUrl, password, room.sessionId!, body, room.model);
     await client.sendText(roomId, reply || "(no output)");
