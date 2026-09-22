@@ -80,6 +80,19 @@ export async function sendMessage(
     .trim();
 }
 
+export type SessionUsage = {
+  cost?: number;
+  tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } };
+  compactedAt?: number;
+};
+
+// Some providers/models routed through OpenRouter don't report cost (e.g. free-tier or
+// BYOK routes), so callers must treat every field here as possibly absent rather than crash.
+export async function getSessionUsage(baseUrl: string, password: string, sessionId: string): Promise<SessionUsage> {
+  const session = await req<any>(baseUrl, password, `/session/${sessionId}`);
+  return { cost: session?.cost, tokens: session?.tokens, compactedAt: session?.time?.compacting };
+}
+
 export async function respondPermission(
   baseUrl: string,
   password: string,
@@ -96,16 +109,19 @@ export async function respondPermission(
 export type PermissionRequest = { sessionId: string; permissionId: string; description: string };
 export type ToolProgress = { sessionId: string; title: string };
 export type SessionError = { sessionId?: string; message: string };
+export type SessionCostUpdate = { sessionId: string; cost?: number };
 
 /**
  * Opens the room's SSE event stream and dispatches permission requests,
- * per-tool-call progress (so a long turn isn't silent end-to-end), and
- * session errors.
+ * per-tool-call progress (so a long turn isn't silent end-to-end), session
+ * errors, live cost updates (for the $-spent alert), and compaction events
+ * (context got trimmed).
  *
  * ponytail: the exact event field names below (`type`, `properties.sessionID`,
  * `.permissionID`, `.title`/`.description`, `message.part.updated`'s
- * `properties.part.{type,tool,state}`) are a best guess from opencode's docs
- * and SDK types, not confirmed against real traffic — unmatched events are
+ * `properties.part.{type,tool,state}`, `session.updated`'s `properties.info.cost`,
+ * `session.compacted`'s `properties.sessionID`) are a best guess from opencode's
+ * docs and SDK types, not confirmed against real traffic — unmatched events are
  * logged raw so the first live run makes any mismatch obvious and cheap to
  * fix in this one function.
  */
@@ -115,6 +131,8 @@ export async function watchPermissions(
   onPermission: (req: PermissionRequest) => void,
   onProgress: (progress: ToolProgress) => void,
   onSessionError: (err: SessionError) => void,
+  onCostUpdate: (update: SessionCostUpdate) => void,
+  onCompacted: (sessionId: string) => void,
   onError: (err: unknown) => void,
 ): Promise<() => void> {
   const controller = new AbortController();
@@ -154,6 +172,10 @@ export async function watchPermissions(
               });
             } else if (evt.type === "session.error") {
               onSessionError({ sessionId: props.sessionID, message: JSON.stringify(props.error ?? props).slice(0, 200) });
+            } else if (evt.type === "session.updated") {
+              onCostUpdate({ sessionId: props.sessionID, cost: props.info?.cost });
+            } else if (evt.type === "session.compacted") {
+              onCompacted(props.sessionID);
             }
           } catch {
             // Not JSON or not a shape we recognize — ignore rather than crash the watcher.

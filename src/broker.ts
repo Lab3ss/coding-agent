@@ -19,7 +19,9 @@
 import { MatrixClient, SimpleFsStorageProvider, AutojoinRoomsMixin } from "matrix-bot-sdk";
 import { getRoom, newRoom, saveRoom, touch, idleRooms, type Room } from "./registry.ts";
 import { provisionRoom, teardownRoom, roomResourceName, roomServerUrl, waitForRunning, getRoomServerPassword } from "./k8s.ts";
-import { createSession, sendMessage, respondPermission, watchPermissions } from "./opencode.ts";
+import { createSession, sendMessage, respondPermission, watchPermissions, getSessionUsage, type SessionUsage } from "./opencode.ts";
+
+const COST_ALERT_STEP_USD = 5;
 
 const homeserver = process.env.MATRIX_HOMESERVER!;
 const matrixToken = process.env.MATRIX_TOKEN!;
@@ -50,6 +52,7 @@ const serverPasswords = new Map<string, string>(); // roomId -> password
 const permissionWatchers = new Map<string, () => void>(); // roomId -> stop()
 const pendingApprovals = new Map<string, (approved: boolean) => void>(); // roomId -> resolver
 const busyRooms = new Set<string>();
+const lastAlertedCostUsd = new Map<string, number>(); // roomId -> $ already notified up to
 
 async function startPermissionWatcher(room: Room) {
   if (permissionWatchers.has(room.roomId)) return;
@@ -81,6 +84,27 @@ async function startPermissionWatcher(room: Room) {
       console.warn(`[${room.roomId}] session error:`, sessErr.message);
       client.sendText(room.roomId, `⚠️ session error: ${sessErr.message}`).catch(() => {});
     },
+    (update) => {
+      if (update.sessionId !== room.sessionId) return;
+      // Some models/providers don't report cost at all — nothing to alert on then.
+      if (typeof update.cost !== "number") return;
+      try {
+        const already = lastAlertedCostUsd.get(room.roomId) ?? 0;
+        if (update.cost - already < COST_ALERT_STEP_USD) return;
+        const step = Math.floor(update.cost / COST_ALERT_STEP_USD) * COST_ALERT_STEP_USD;
+        lastAlertedCostUsd.set(room.roomId, step);
+        client
+          .sendText(room.roomId, `💸 ~$${step} spent so far this session. Send /usage for the full breakdown.`)
+          .catch((err) => console.warn(`[${room.roomId}] failed to send cost alert:`, err?.message ?? err));
+      } catch (err: any) {
+        console.warn(`[${room.roomId}] cost alert check failed:`, err?.message ?? err);
+      }
+    },
+    (sessionId) => {
+      if (sessionId !== room.sessionId) return;
+      console.log(`[${room.roomId}] 🗜️ context compacted`);
+      client.sendText(room.roomId, "🗜️ Context got compacted (older history was trimmed to make room).").catch(() => {});
+    },
     (err) => console.warn(`[${room.roomId}] permission watcher error:`, err?.message ?? err),
   );
   permissionWatchers.set(room.roomId, stop);
@@ -92,10 +116,30 @@ async function announce(room: Room, text: string): Promise<void> {
   await client.sendText(room.roomId, text);
 }
 
+function formatUsage(usage: SessionUsage): string {
+  const cost = typeof usage.cost === "number" ? `$${usage.cost.toFixed(4)}` : "n/a (not reported for this model)";
+  const t = usage.tokens;
+  const tokens = t
+    ? `in: ${t.input} · out: ${t.output} · reasoning: ${t.reasoning} · cache read: ${t.cache.read} · cache write: ${t.cache.write}`
+    : "n/a";
+  const context = usage.compactedAt ? `compacted at ${new Date(usage.compactedAt).toLocaleString()}` : "not compacted";
+  return `📊 Usage for this session\n💰 Cost: ${cost}\n🔢 Tokens — ${tokens}\n🗜️ Context: ${context}`;
+}
+
+/** Live pull, not the cached SSE state — always accurate, and works even before any
+ * session.updated event has arrived. Throws on failure; callers decide how to handle that. */
+async function sendUsage(room: Room): Promise<void> {
+  const password = serverPasswords.get(room.roomId) ?? (await getRoomServerPassword(room.podName!));
+  const baseUrl = roomServerUrl(room.podName!);
+  const usage = await getSessionUsage(baseUrl, password, room.sessionId!);
+  await client.sendText(room.roomId, formatUsage(usage));
+}
+
 function stopPermissionWatcher(roomId: string) {
   permissionWatchers.get(roomId)?.();
   permissionWatchers.delete(roomId);
   serverPasswords.delete(roomId);
+  lastAlertedCostUsd.delete(roomId); // a re-provision starts a fresh $0 opencode session
 }
 
 /**
@@ -187,8 +231,22 @@ client.on("room.message", async (roomId: string, event: any) => {
 
   if (/^\/stop\b/i.test(body)) {
     const room = getRoom(roomId);
-    if (!room?.podName) await client.sendText(roomId, "Nothing running here.");
-    else await teardown(room, "requested");
+    if (!room?.podName) {
+      await client.sendText(roomId, "Nothing running here.");
+      return;
+    }
+    await sendUsage(room).catch((err) => console.warn(`[${roomId}] usage fetch on stop failed:`, err?.message ?? err));
+    await teardown(room, "requested");
+    return;
+  }
+
+  if (/^\/usage\b/i.test(body)) {
+    const room = getRoom(roomId);
+    if (!room?.podName) {
+      await client.sendText(roomId, "Nothing running here yet — send a message first to provision the workspace.");
+      return;
+    }
+    await sendUsage(room).catch((err) => client.sendText(roomId, `⚠️ couldn't fetch usage: ${err?.message ?? err}`));
     return;
   }
 

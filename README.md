@@ -51,6 +51,11 @@ sending prompts, and relaying `opencode`'s own permission/approval prompts
    shows the current one. Useful if onboarding was given an invalid model id
    (`/stop` alone does **not** fix this — it only tears down the pod, the
    remembered model is unchanged).
+7. `/usage` reports the current session's cost, token breakdown
+   (input/output/reasoning/cache), and whether the context has been
+   compacted. Also shown automatically on `/stop`, and as a one-line alert
+   every $5 spent. Some models/providers don't report cost — shown as "n/a"
+   rather than failing.
 
 ## Config (env vars on the broker)
 
@@ -115,3 +120,31 @@ in the GitOps repo:
 
 Shipping a code change: rebuild + push whichever image changed for
 `linux/amd64`, bump its tag in the GitOps repo, commit, and reconcile.
+
+```sh
+# 1. Ship the code
+git push origin main
+
+# 2. Build + push the broker image (swap Dockerfile/image name for the runner)
+VERSION=X.X.XX
+docker buildx build --platform linux/amd64 -t ghcr.io/lab3ss/coding-agent:$VERSION --push .
+
+# 3. Bump the tag in the GitOps repo
+git clone --depth 1 https://github.com/Lab3ss/k3s-gitops.git /tmp/k3s-gitops-deploy
+cd /tmp/k3s-gitops-deploy
+sed -i '' "s|ghcr.io/lab3ss/coding-agent:.*|ghcr.io/lab3ss/coding-agent:$VERSION|" apps/coding-agent/deployment.yaml
+git commit -am "chore: bump coding-agent to $VERSION"
+git push origin main
+
+# 4. Force an immediate rollout instead of waiting for Flux's poll interval
+flux reconcile kustomization apps -n flux-system --with-source
+
+# 5. Verify
+kubectl rollout status -n coding-agent deploy/coding-agent
+kubectl get deploy -n coding-agent coding-agent -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+`strategy: Recreate` on the Deployment means the old broker pod stops before
+the new one starts — any in-flight room task gets interrupted (the SQLite
+registry is on a PVC, so nothing is lost; the room just re-provisions on its
+next message).
