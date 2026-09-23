@@ -26,6 +26,7 @@ import {
   watchPermissions,
   getSessionUsage,
   probeConnection,
+  abortSession,
   type SessionUsage,
 } from "./opencode.ts";
 
@@ -143,6 +144,15 @@ async function sendUsage(room: Room): Promise<void> {
   await client.sendText(room.roomId, formatUsage(usage));
 }
 
+// fetch() wraps the real undici error (e.g. UND_ERR_HEADERS_TIMEOUT, UND_ERR_CONNECT_TIMEOUT)
+// in a generic `TypeError: fetch failed` with the actual cause on `.cause` — logging err.message
+// alone just prints "fetch failed" with no way to tell a timeout from a connect error.
+function describeError(err: any): string {
+  const code = err?.cause?.code ?? err?.code;
+  const message = err?.cause?.message ?? err?.message ?? String(err);
+  return code ? `${message} (code=${code})` : message;
+}
+
 function stopPermissionWatcher(roomId: string) {
   permissionWatchers.get(roomId)?.();
   permissionWatchers.delete(roomId);
@@ -196,7 +206,7 @@ async function retryUntilReady<T>(fn: () => Promise<T>, attempts = 10, delayMs =
       return await fn();
     } catch (err: any) {
       lastErr = err;
-      console.warn(`[retryUntilReady] attempt ${i + 1}/${attempts} failed:`, err?.message ?? err);
+      console.warn(`[retryUntilReady] attempt ${i + 1}/${attempts} failed: ${describeError(err)}`);
       await new Promise((r) => setTimeout(r, delayMs));
     }
   }
@@ -392,7 +402,16 @@ client.on("room.message", async (roomId: string, event: any) => {
     // timeout be told apart from a genuine long task cut short vs. a stall: cross-reference
     // against the last "🔧 ..." tool-progress line for this room to see whether opencode was
     // still actively working right up to the cutoff, or had gone silent well before it.
-    console.error(`[${roomId}] sendMessage failed after ${Date.now() - sentAt}ms (code=${err?.code ?? "?"}): ${err?.message ?? err}`);
+    console.error(`[${roomId}] sendMessage failed after ${Date.now() - sentAt}ms: ${describeError(err)}`);
+    // Without this, opencode has no idea the broker gave up — the turn keeps running
+    // server-side, and since a session handles one turn at a time, every future message on
+    // this session queues silently behind it forever instead of erroring. Best-effort: a
+    // failure here shouldn't hide the original error from the user.
+    if (room.podName && room.sessionId) {
+      await abortSession(roomServerUrl(room.podName), serverPasswords.get(roomId)!, room.sessionId).catch(
+        (abortErr: any) => console.warn(`[${roomId}] session abort failed:`, describeError(abortErr)),
+      );
+    }
     await client.sendText(roomId, `⚠️ ${err?.message ?? err}`);
   } finally {
     busyRooms.delete(roomId);

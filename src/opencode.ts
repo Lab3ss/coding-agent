@@ -91,6 +91,18 @@ export async function sendMessage(
     .trim();
 }
 
+/**
+ * Stops any ongoing AI processing/command execution for a session. Must be called whenever
+ * our own client-side sendMessage call gives up (timeout or otherwise) — opencode has no
+ * visibility into "the broker stopped waiting", so without this the turn keeps running
+ * server-side forever, and since a session processes one turn at a time, every subsequent
+ * message on that session queues silently behind it (zero CPU, zero network — just stuck
+ * waiting its turn) instead of erroring.
+ */
+export async function abortSession(baseUrl: string, password: string, sessionId: string): Promise<void> {
+  await req(baseUrl, password, `/session/${sessionId}/abort`, { method: "POST" });
+}
+
 export type SessionUsage = {
   cost?: number;
   tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } };
