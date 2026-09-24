@@ -51,14 +51,23 @@ const fakeRegistry: RegistryService = {
   idle: () => [],
 };
 
+// Failure toggles — flip these to drive the typed error paths end-to-end.
+const failures = {
+  provision: false as "provision-failed" | false,
+  sendMessage: null as "message-send-failed" | null,
+  usage: false as "usage-fetch-failed" | false,
+};
+
 const fakeWorkspace: WorkspaceService = {
   resourceName: (id) => `room-test-${id.replace(/[^a-z0-9]/gi, "")}`,
   serverUrl: (name) => `http://${name}`,
   provision: (name, _project, rules) =>
-    Effect.sync(() => {
-      calls.provision.push({ name, rules });
-      return "server-password";
-    }),
+    failures.provision
+      ? Effect.fail(failures.provision)
+      : Effect.sync(() => {
+          calls.provision.push({ name, rules });
+          return "server-password";
+        }),
   waitForRunning: () => Effect.void,
   readPodState: () => Effect.succeed("running"),
   teardown: (name) =>
@@ -69,15 +78,17 @@ const fakeWorkspace: WorkspaceService = {
   createSession: () => Effect.succeed("ses1"),
   probe: () => Effect.void,
   sendMessage: (_b, _p, _s, text) =>
-    Effect.sync(() => {
-      calls.sent.push(text);
-      return `did the thing: ${text}`;
-    }),
+    failures.sendMessage
+      ? Effect.fail(failures.sendMessage)
+      : Effect.sync(() => {
+          calls.sent.push(text);
+          return `did the thing: ${text}`;
+        }),
   abort: () =>
     Effect.sync(() => {
       calls.aborted++;
     }),
-  usage: () => Effect.succeed({ cost: 1.25 }),
+  usage: () => (failures.usage ? Effect.fail(failures.usage) : Effect.succeed({ cost: 1.25 })),
   respondPermission: (_b, _p, _s, _pid, approved) =>
     Effect.sync(() => {
       calls.respond.push(approved);
@@ -129,6 +140,9 @@ const reset = () => {
   calls.sent.length = 0;
   calls.aborted = 0;
   calls.redacted = 0;
+  failures.provision = false;
+  failures.sendMessage = null;
+  failures.usage = false;
   watchHandlers = undefined;
 };
 
@@ -222,7 +236,39 @@ test("/model updates per-message routing without touching the pod", async () => 
 
 test("broken input during onboarding re-asks instead of provisioning", async () => {
   reset();
-  await run({ conversationId: "!t2", text: "fix the login bug please" });
-  assert.equal(rooms.get("!t2")?.onboarding, "repo"); // no repo parsed, still asking
+  await run({ conversationId: "!t7", text: "fix the login bug please" });
+  assert.equal(rooms.get("!t7")?.onboarding, "repo"); // no repo parsed, still asking
   assert.equal(calls.provision.length, 0);
+});
+
+test("onboarding provision failure surfaces the typed code in the room", async () => {
+  reset();
+  await run({ conversationId: "!t8", text: "lab3ss/coding-agent" });
+  await run({ conversationId: "!t8", text: "ghp_token1234567", messageId: "$m1" });
+  failures.provision = "provision-failed";
+  await run({ conversationId: "!t8", text: "anthropic/claude-sonnet-4.5" });
+  const err = recorded.find((r) => r.event.type === "error");
+  assert.ok(err);
+  assert.equal(err.event.type === "error" && err.event.text, "setup failed: provision-failed (details in broker logs)");
+});
+
+test("task failure surfaces the typed code and aborts the server-side turn", async () => {
+  reset();
+  await onboard("!t9");
+  failures.sendMessage = "message-send-failed";
+  await run({ conversationId: "!t9", text: "fix the login bug" });
+  assert.equal(calls.aborted, 1); // turn aborted so it can't queue future messages
+  const err = recorded.find((r) => r.event.type === "error");
+  assert.ok(err);
+  assert.equal(err.event.type === "error" && err.event.text, "task failed: message-send-failed (details in broker logs)");
+});
+
+test("/usage failure surfaces the typed code", async () => {
+  reset();
+  await onboard("!t10");
+  failures.usage = "usage-fetch-failed";
+  await run({ conversationId: "!t10", text: "/usage" });
+  const err = recorded.find((r) => r.event.type === "error");
+  assert.ok(err);
+  assert.equal(err.event.type === "error" && err.event.text, "couldn't fetch usage: usage-fetch-failed (details in broker logs)");
 });

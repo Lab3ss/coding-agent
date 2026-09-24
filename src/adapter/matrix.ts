@@ -13,7 +13,7 @@
  */
 import { AutojoinRoomsMixin, MatrixClient, SimpleFsStorageProvider } from "matrix-bot-sdk";
 import { Effect, Layer } from "effect";
-import { ChatAdapter, type ChannelCapabilities, type InboundMessage, type OutboundEvent } from "./types.ts";
+import { ChatAdapter, type ChannelCapabilities, type ChatAdapterService, type InboundMessage, type OutboundEvent } from "./types.ts";
 import { describeError, splitForMatrix } from "../util.ts";
 
 export type MatrixAdapterConfig = {
@@ -116,11 +116,25 @@ const APPROVAL_ANSWER_RE = /^(y|yes|ok|okay|approve|approved|go|sure|👍|✅)\b
 // seconds of each other, and even the smallest cap far exceeds that.
 const SEEN_EVENT_IDS_CAP = 2000;
 
-const makeMatrixAdapter = (config: MatrixAdapterConfig) =>
+const makeMatrixAdapter = (config: MatrixAdapterConfig): Effect.Effect<ChatAdapterService, "chat-start-failed"> =>
   Effect.gen(function* () {
-    const client = new MatrixClient(config.homeserver, config.token, new SimpleFsStorageProvider(config.storagePath));
+    // Constructor is sync and can only fail on bad arguments — still classified
+    // so nothing below this line can throw.
+    const client = yield* Effect.try({
+      try: () => new MatrixClient(config.homeserver, config.token, new SimpleFsStorageProvider(config.storagePath)),
+      catch: (cause) => {
+        console.error(`[matrix] chat-start-failed: cannot construct client — ${describeError(cause)}`);
+        return "chat-start-failed" as const;
+      },
+    });
     AutojoinRoomsMixin.setupOnClient(client); // join when invited — this channel's membership policy
-    const me = yield* Effect.tryPromise(() => client.getUserId());
+    const me = yield* Effect.tryPromise({
+      try: () => client.getUserId(),
+      catch: (cause) => {
+        console.error(`[matrix] chat-start-failed: getUserId failed — ${describeError(cause)}`);
+        return "chat-start-failed" as const;
+      },
+    });
     const startedAt = Date.now();
     console.log(`[coding-agent] matrix adapter up as ${me} on ${config.homeserver}`);
 
@@ -164,7 +178,7 @@ const makeMatrixAdapter = (config: MatrixAdapterConfig) =>
         Effect.catchAll(() => Effect.succeed(undefined)),
       );
 
-    const start = (onInbound: (msg: InboundMessage) => void): Effect.Effect<void, unknown> =>
+    const start = (onInbound: (msg: InboundMessage) => void): Effect.Effect<void, "chat-start-failed"> =>
       Effect.gen(function* () {
         client.on("room.message", (roomId: string, event: any) => {
           if (event.sender === me) return;
@@ -183,7 +197,13 @@ const makeMatrixAdapter = (config: MatrixAdapterConfig) =>
             text: (event.content.body ?? "").trim(),
           });
         });
-        yield* Effect.tryPromise(() => client.start());
+        yield* Effect.tryPromise({
+          try: () => client.start(),
+          catch: (cause) => {
+            console.error(`[matrix] chat-start-failed: sync loop failed to start — ${describeError(cause)}`);
+            return "chat-start-failed" as const;
+          },
+        });
       });
 
     return {
@@ -193,7 +213,7 @@ const makeMatrixAdapter = (config: MatrixAdapterConfig) =>
       label,
       start,
       parseApprovalAnswer: (text: string) => APPROVAL_ANSWER_RE.test(text),
-    } satisfies import("./types.ts").ChatAdapterService;
+    } satisfies ChatAdapterService;
   });
 
 export const MatrixAdapterLive = (config: MatrixAdapterConfig) => Layer.effect(ChatAdapter, makeMatrixAdapter(config));

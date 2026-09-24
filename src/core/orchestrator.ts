@@ -11,15 +11,18 @@
  *   Registry     — persisted per-conversation state (repo/token/model/pod)
  *   Workspace    — k8s provisioning + the room's opencode server
  *
- * handleInbound never fails: any escape becomes a room-visible error event,
- * so one bad message can't take the broker down (the transport handler in
- * src/broker.ts is only a belt-and-suspenders boundary).
+ * handleInbound never fails: every failure below it is already a typed,
+ * string-literal code (see WorkspaceError), and any escape — even a defect
+ * thrown by sync infra — becomes a room-visible error event, so one bad
+ * message can't take the broker down. Room-visible texts carry the stable
+ * code (e.g. "task failed: message-send-failed"); raw causes (HTTP status,
+ * errno, stack) are logged exactly once, at the seam that produced them.
  */
 import { Context, Effect, Layer } from "effect";
 import { ChatAdapter, type InboundMessage, type OutboundEvent } from "../adapter/types.ts";
 import { describeError, formatUsage, parseRepo } from "../util.ts";
 import { Registry, type Room } from "./registry-service.ts";
-import { Workspace } from "./workspace.ts";
+import { Workspace, type WorkspaceError } from "./workspace.ts";
 
 const COST_ALERT_STEP_USD = 5;
 
@@ -31,12 +34,13 @@ export type OrchestratorConfig = {
 };
 
 export interface OrchestratorService {
-  /** Handles one inbound user message. Never fails (catch-all below is total). */
+  /** Handles one inbound user message. Error channel is `never`: every path
+   * either succeeds or turns its typed code into a room-visible error event. */
   readonly handleInbound: (msg: InboundMessage) => Effect.Effect<void>;
   /** Starts background loops (idle sweep) and hooks the chat adapter's inbound
-   * stream into handleInbound. Forks and returns immediately. Fails if the
-   * transport can't come up — a boot failure the entry point should crash on. */
-  readonly start: Effect.Effect<void, unknown>;
+   * stream into handleInbound. Forks and returns immediately. Fails with a
+   * stable code if the transport can't come up — boot should crash on it. */
+  readonly start: Effect.Effect<void, "chat-start-failed">;
 }
 
 export class Orchestrator extends Context.Tag("coding-agent/Orchestrator")<Orchestrator, OrchestratorService>() {}
@@ -61,6 +65,13 @@ const make = (config: OrchestratorConfig) =>
 
     const announce = (room: Room, text: string): Effect.Effect<void> => send(room.roomId, { type: "status", text });
 
+    /** What the room sees when a typed code surfaces — the code is the
+     * identified reason; the underlying cause lives in the broker logs. */
+    const errorEvent = (code: WorkspaceError, prefix = "failed"): OutboundEvent => ({
+      type: "error",
+      text: `${prefix}: ${code} (details in broker logs)`,
+    });
+
     function stopWatcher(conversationId: string): void {
       permissionWatchers.get(conversationId)?.();
       permissionWatchers.delete(conversationId);
@@ -72,7 +83,7 @@ const make = (config: OrchestratorConfig) =>
       pendingApprovals.delete(conversationId);
     }
 
-    const startWatcher = (room: Room) =>
+    const startWatcher = (room: Room): Effect.Effect<void, "watch-failed"> =>
       Effect.gen(function* () {
         if (permissionWatchers.has(room.roomId)) return;
         const password = serverPasswords.get(room.roomId);
@@ -92,9 +103,7 @@ const make = (config: OrchestratorConfig) =>
                 // don't POST a permission response to a dead pod.
                 if (!permissionWatchers.has(room.roomId)) return;
                 yield* workspace.respondPermission(baseUrl, password, permReq.sessionId, permReq.permissionId, approved).pipe(
-                  Effect.catchAll((err) =>
-                    send(room.roomId, { type: "error", text: `failed to record approval: ${describeError(err)}` }),
-                  ),
+                  Effect.catchAll((code) => send(room.roomId, errorEvent(code, "failed to record approval"))),
                 );
               }),
             ).catch((err) => console.warn(`[${room.roomId}] approval flow failed:`, describeError(err)));
@@ -151,17 +160,28 @@ const make = (config: OrchestratorConfig) =>
      * every message would retry a black hole forever (the Secret still exists,
      * so password recovery "succeeds" into nothing).
      */
-    const ensureProvisioned = (room: Room) =>
+    /** Everything ensureProvisioned can fail with — callers switch on these codes. */
+    type ProvisionError =
+      | "pod-read-failed"
+      | "provision-failed"
+      | "pod-wait-failed"
+      | "session-create-failed"
+      | "secret-read-failed"
+      | "watch-failed";
+
+    const ensureProvisioned = (room: Room): Effect.Effect<void, ProvisionError> =>
       Effect.gen(function* () {
         if (room.podName) {
+          // A pod-read failure is an API/rbac hiccup, not proof the pod is dead —
+          // treat like the pending/unknown case and keep the recovery path.
           const state = yield* workspace
             .readPodState(room.podName)
             .pipe(Effect.catchAll(() => Effect.succeed("unknown" as const)));
           if (state === "gone" || state === "failed") {
             yield* announce(room, "♻️ previous workspace pod is gone — re-provisioning…");
             yield* workspace.teardown(room.podName).pipe(
-              Effect.catchAll((err) =>
-                Effect.sync(() => console.warn(`[${room.roomId}] stale pod cleanup failed:`, describeError(err))),
+              Effect.catchAll((code) =>
+                Effect.sync(() => console.warn(`[${room.roomId}] stale pod cleanup failed: ${code}`)),
               ),
             );
             room.podName = undefined;
@@ -197,6 +217,8 @@ const make = (config: OrchestratorConfig) =>
       registry.save(room);
     }
 
+    /** Total: a failed k8s delete must never block the room's teardown — the
+     * cause is logged at the seam ("teardown-failed"). */
     const teardown = (room: Room, reason: string): Effect.Effect<void> =>
       Effect.gen(function* () {
         stopWatcher(room.roomId);
@@ -209,7 +231,7 @@ const make = (config: OrchestratorConfig) =>
 
     /** Live usage pull, not the cached SSE state — always accurate, and works even
      * before any session.updated event has arrived. */
-    const sendUsage = (room: Room) =>
+    const sendUsage = (room: Room): Effect.Effect<void, "usage-fetch-failed" | "secret-read-failed"> =>
       Effect.gen(function* () {
         const password = serverPasswords.get(room.roomId) ?? (yield* workspace.serverPassword(room.podName!));
         const usage = yield* workspace.usage(workspace.serverUrl(room.podName!), password, room.sessionId!);
@@ -234,7 +256,7 @@ const make = (config: OrchestratorConfig) =>
         const reply = yield* workspace.sendMessage(baseUrl, password, room.sessionId!, body, room.model);
         yield* send(room.roomId, { type: "result", text: reply || "(no output)" });
       }).pipe(
-        Effect.catchAll((err) =>
+        Effect.catchAll((code) =>
           Effect.gen(function* () {
             // Only console.log's own line has a timestamp (via `kubectl logs --timestamps`) and
             // survives independently of Matrix — the error text sent to the room can get lost in
@@ -242,7 +264,7 @@ const make = (config: OrchestratorConfig) =>
             // timeout be told apart from a genuine long task cut short vs. a stall: cross-reference
             // against the last "🔧 ..." progress line for this room to see whether opencode was
             // still actively working right up to the cutoff, or had gone silent well before it.
-            console.error(`[${room.roomId}] task failed after ${Date.now() - sentAt}ms: ${describeError(err)}`);
+            console.error(`[${room.roomId}] task failed after ${Date.now() - sentAt}ms: ${code}`);
             // Without this, opencode has no idea the core gave up — the turn keeps running
             // server-side, and since a session handles one turn at a time, every future message
             // on this session queues silently behind it forever instead of erroring. Best-effort:
@@ -251,12 +273,12 @@ const make = (config: OrchestratorConfig) =>
               yield* workspace
                 .abort(workspace.serverUrl(room.podName), serverPasswords.get(room.roomId)!, room.sessionId)
                 .pipe(
-                  Effect.catchAll((abortErr) =>
-                    Effect.sync(() => console.warn(`[${room.roomId}] session abort failed:`, describeError(abortErr))),
+                  Effect.catchAll((abortCode) =>
+                    Effect.sync(() => console.warn(`[${room.roomId}] session abort failed: ${abortCode}`)),
                   ),
                 );
             }
-            yield* send(room.roomId, { type: "error", text: describeError(err) });
+            yield* send(room.roomId, errorEvent(code, "task failed"));
           }),
         ),
       );
@@ -269,9 +291,7 @@ const make = (config: OrchestratorConfig) =>
         yield* ensureProvisioned(room);
         yield* send(room.roomId, { type: "info", text: "✅ Ready. What would you like me to do?" });
       }).pipe(
-        Effect.catchAll((err) =>
-          send(room.roomId, { type: "error", text: `setup failed: ${describeError(err)}` }),
-        ),
+        Effect.catchAll((code) => send(room.roomId, errorEvent(code, "setup failed"))),
         Effect.ensuring(Effect.sync(() => busyRooms.delete(room.roomId))),
       );
 
@@ -292,7 +312,7 @@ const make = (config: OrchestratorConfig) =>
             return;
           }
           yield* sendUsage(room).pipe(
-            Effect.catchAll((err) => Effect.sync(() => console.warn(`[${roomId}] usage fetch on stop failed:`, describeError(err)))),
+            Effect.catchAll((code) => Effect.sync(() => console.warn(`[${roomId}] usage fetch on stop failed: ${code}`))),
           );
           yield* teardown(room, "requested");
           return;
@@ -308,7 +328,7 @@ const make = (config: OrchestratorConfig) =>
             return;
           }
           yield* sendUsage(room).pipe(
-            Effect.catchAll((err) => send(roomId, { type: "error", text: `couldn't fetch usage: ${describeError(err)}` })),
+            Effect.catchAll((code) => send(roomId, errorEvent(code, "couldn't fetch usage"))),
           );
           return;
         }
@@ -322,7 +342,13 @@ const make = (config: OrchestratorConfig) =>
             });
             return;
           }
-          const password = serverPasswords.get(roomId) ?? (yield* workspace.serverPassword(room.podName));
+          const cached = serverPasswords.get(roomId);
+          const password = cached ?? (yield* workspace.serverPassword(room.podName).pipe(
+            Effect.catchAll((code) =>
+              send(roomId, errorEvent(code, "couldn't read the server password")).pipe(Effect.as(undefined)),
+            ),
+          ));
+          if (!password) return;
           serverPasswords.set(roomId, password);
           yield* send(
             roomId,
@@ -428,22 +454,30 @@ const make = (config: OrchestratorConfig) =>
         busyRooms.add(room.roomId);
         yield* runTask(room, body).pipe(Effect.ensuring(Effect.sync(() => busyRooms.delete(room.roomId))));
       }).pipe(
-        // Error boundary: any escape becomes a room-visible error event instead
-        // of an unhandled rejection (send never fails, so this composition is
-        // total — one bad message can never take the broker down).
-        Effect.catchAll((err) => send(msg.conversationId, { type: "error", text: describeError(err) })),
+        // Error boundary, total by construction: every workspace failure above
+        // is already a typed code caught at its call site, so catchAll only
+        // fires for genuinely unexpected paths (its `code` is statically
+        // `never` here) — and catchDefect even converts a defect thrown by
+        // sync infra (e.g. SQLite) into a room-visible event instead of an
+        // unhandled rejection. One bad message can never take the broker down.
+        Effect.catchAll((code) => send(msg.conversationId, errorEvent(code))),
+        Effect.catchAllDefect((defect) =>
+          Effect.gen(function* () {
+            console.error(`[${msg.conversationId}] internal-defect:`, describeError(defect));
+            yield* send(msg.conversationId, { type: "error", text: "internal-defect (details in broker logs)" });
+          }),
+        ),
       );
 
-    const sweep = Effect.forEach(registry.idle(config.idleTeardownMs), (room) =>
-      Effect.gen(function* () {
-        console.log(`[${room.roomId}] idle >${(config.idleTeardownMs / 3600_000).toFixed(1)}h — tearing down`);
-        yield* teardown(room, "idle").pipe(
-          Effect.catchAll((err) => Effect.sync(() => console.warn(`[${room.roomId}] teardown failed:`, describeError(err)))),
-        );
-      }),
-    );
+    const sweep: Effect.Effect<void> =
+      Effect.forEach(registry.idle(config.idleTeardownMs), (room) =>
+        Effect.gen(function* () {
+          console.log(`[${room.roomId}] idle >${(config.idleTeardownMs / 3600_000).toFixed(1)}h — tearing down`);
+          yield* teardown(room, "idle"); // total — k8s delete failures are logged at the seam
+        }),
+      );
 
-    const start: Effect.Effect<void, unknown> =
+    const start: Effect.Effect<void, "chat-start-failed"> =
       Effect.gen(function* () {
         const sweepLoop = Effect.forever(Effect.andThen(Effect.sleep(config.sweepIntervalMs), sweep));
         yield* Effect.forkDaemon(sweepLoop);
