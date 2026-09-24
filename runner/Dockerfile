@@ -4,11 +4,16 @@
 # chosen model/provider; the broker drives it over HTTP (see src/opencode.ts).
 FROM node:22-bookworm-slim
 
+# Pin the opencode version: an unpinned `npm install -g opencode-ai` makes
+# every image rebuild a potential silent major-version jump (breaking runner
+# behavior/APIs between otherwise identical deployments). Bump deliberately.
+ARG OPENCODE_VERSION=1.18.32
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g opencode-ai
+RUN npm install -g --no-fund --no-audit "opencode-ai@${OPENCODE_VERSION}"
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && chown node:node /entrypoint.sh
