@@ -26,6 +26,11 @@ function authHeader(password: string): string {
   return "Basic " + Buffer.from(`opencode:${password}`).toString("base64");
 }
 
+// undici's fetch returns undici's own Response type (its stream types don't
+// line up with the DOM `Response` globals) — derive it instead of importing,
+// so the fetch/agent pair always stays type-consistent.
+type UndiciResponse = Awaited<ReturnType<typeof undiciFetch>>;
+
 async function req<T>(baseUrl: string, password: string, path: string, init?: RequestInit): Promise<T> {
   const attempt = () =>
     undiciFetch(baseUrl + path, {
@@ -33,7 +38,7 @@ async function req<T>(baseUrl: string, password: string, path: string, init?: Re
       headers: { "content-type": "application/json", authorization: authHeader(password), ...(init?.headers ?? {}) },
       dispatcher: longRunningDispatcher,
     } as Parameters<typeof undiciFetch>[1]);
-  let res: Response;
+  let res: UndiciResponse;
   try {
     res = await attempt();
   } catch (err: any) {
@@ -134,11 +139,18 @@ export type ToolProgress = { sessionId: string; title: string };
 export type SessionError = { sessionId?: string; message: string };
 export type SessionCostUpdate = { sessionId: string; cost?: number };
 
+export type SseHandlers = {
+  onPermission: (req: PermissionRequest) => void;
+  onProgress: (progress: ToolProgress) => void;
+  onSessionError: (err: SessionError) => void;
+  onCostUpdate: (update: SessionCostUpdate) => void;
+  onCompacted: (sessionId: string) => void;
+};
+
 /**
- * Opens the room's SSE event stream and dispatches permission requests,
- * per-tool-call progress (so a long turn isn't silent end-to-end), session
- * errors, live cost updates (for the $-spent alert), and compaction events
- * (context got trimmed).
+ * Maps one raw `/global/event` SSE payload onto the typed handlers. Kept as a
+ * separate exported function so the (hand-rolled, see below) event-shape
+ * guesses are unit-testable without a live opencode server.
  *
  * ponytail: the exact event field names below (`type`, `properties.sessionID`,
  * `.permissionID`, `.title`/`.description`, `message.part.updated`'s
@@ -147,6 +159,60 @@ export type SessionCostUpdate = { sessionId: string; cost?: number };
  * docs and SDK types, not confirmed against real traffic — unmatched events are
  * logged raw so the first live run makes any mismatch obvious and cheap to
  * fix in this one function.
+ */
+export function dispatchEvent(evt: any, handlers: SseHandlers): void {
+  const props = evt.properties ?? evt;
+  if (evt.type?.includes("permission") && props.permissionID) {
+    handlers.onPermission({
+      sessionId: props.sessionID,
+      permissionId: props.permissionID,
+      description: props.title ?? props.description ?? JSON.stringify(props).slice(0, 200),
+    });
+  } else if (evt.type === "message.part.updated" && props.part?.type === "tool" && props.part.state?.status === "running") {
+    handlers.onProgress({
+      sessionId: props.part.sessionID,
+      title: props.part.state.title ?? props.part.tool,
+    });
+  } else if (evt.type === "session.error") {
+    handlers.onSessionError({ sessionId: props.sessionID, message: JSON.stringify(props.error ?? props).slice(0, 200) });
+  } else if (evt.type === "session.updated") {
+    handlers.onCostUpdate({ sessionId: props.sessionID, cost: props.info?.cost });
+  } else if (evt.type === "session.compacted") {
+    handlers.onCompacted(props.sessionID);
+  }
+}
+
+/** Feed one raw SSE `data:` line (already trimmed of its prefix) to dispatchEvent. */
+function dispatchDataLine(line: string, handlers: SseHandlers): void {
+  try {
+    dispatchEvent(JSON.parse(line), handlers);
+  } catch {
+    // Not JSON or not a shape we recognize — ignore rather than crash the watcher.
+  }
+}
+
+const SSE_RETRY_BASE_MS = 1_000;
+const SSE_RETRY_MAX_MS = 30_000;
+
+/**
+ * Opens the room's SSE event stream and dispatches permission requests,
+ * per-tool-call progress (so a long turn isn't silent end-to-end), session
+ * errors, live cost updates (for the $-spent alert), and compaction events
+ * (context got trimmed).
+ *
+ * Reconnects forever with capped exponential backoff until the returned stop()
+ * is called — opencode's stream drops on any transient network blip, pod
+ * restart, or proxy idle timeout, and a dead watcher silently kills the
+ * approval flow (opencode waits for an allow/deny that is never relayed, so
+ * the turn hangs forever with zero feedback in the room). The broker's
+ * startPermissionWatcher() early-returns while a watcher entry exists, so
+ * without internal reconnection a single drop would permanently deafen the
+ * room.
+ *
+ * ponytail: events emitted while the stream is down are NOT backfilled —
+ * opencode has no Last-Event-ID replay we can rely on, so a permission
+ * request landing inside a reconnect gap can still be missed. The reconnect
+ * window is seconds, vs the previous behavior of "down forever".
  */
 export async function watchPermissions(
   baseUrl: string,
@@ -159,54 +225,57 @@ export async function watchPermissions(
   onError: (err: unknown) => void,
 ): Promise<() => void> {
   const controller = new AbortController();
+  const handlers: SseHandlers = { onPermission, onProgress, onSessionError, onCostUpdate, onCompacted };
+
   (async () => {
-    try {
-      const res = await undiciFetch(baseUrl + "/global/event", {
-        headers: { authorization: authHeader(password) },
-        signal: controller.signal,
-        dispatcher: longRunningDispatcher,
-      } as Parameters<typeof undiciFetch>[1]);
-      if (!res.ok || !res.body) throw new Error(`/global/event -> ${res.status}`);
-      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
-      let buf = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += value;
-        let idx: number;
-        while ((idx = buf.indexOf("\n\n")) !== -1) {
-          const chunk = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-          const line = chunk.split("\n").find((l) => l.startsWith("data:"));
-          if (!line) continue;
-          try {
-            const evt = JSON.parse(line.slice(5).trim());
-            const props = evt.properties ?? evt;
-            if (evt.type?.includes("permission") && props.permissionID) {
-              onPermission({
-                sessionId: props.sessionID,
-                permissionId: props.permissionID,
-                description: props.title ?? props.description ?? JSON.stringify(props).slice(0, 200),
-              });
-            } else if (evt.type === "message.part.updated" && props.part?.type === "tool" && props.part.state?.status === "running") {
-              onProgress({
-                sessionId: props.part.sessionID,
-                title: props.part.state.title ?? props.part.tool,
-              });
-            } else if (evt.type === "session.error") {
-              onSessionError({ sessionId: props.sessionID, message: JSON.stringify(props.error ?? props).slice(0, 200) });
-            } else if (evt.type === "session.updated") {
-              onCostUpdate({ sessionId: props.sessionID, cost: props.info?.cost });
-            } else if (evt.type === "session.compacted") {
-              onCompacted(props.sessionID);
-            }
-          } catch {
-            // Not JSON or not a shape we recognize — ignore rather than crash the watcher.
+    let attempt = 0;
+    while (!controller.signal.aborted) {
+      try {
+        const res = await undiciFetch(baseUrl + "/global/event", {
+          headers: { authorization: authHeader(password) },
+          signal: controller.signal,
+          dispatcher: longRunningDispatcher,
+        } as Parameters<typeof undiciFetch>[1]);
+        if (!res.ok || !res.body) throw new Error(`/global/event -> ${res.status}`);
+        attempt = 0; // healthy connection — reset backoff
+        // Decode manually rather than pipeThrough(TextDecoderStream) — undici's
+        // ReadableStream type doesn't line up with the DOM transform-stream types.
+        const decoder = new TextDecoder();
+        const reader = res.body.getReader();
+        let buf = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx: number;
+          while ((idx = buf.indexOf("\n\n")) !== -1) {
+            const chunk = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            const line = chunk.split("\n").find((l) => l.startsWith("data:"));
+            if (!line) continue;
+            dispatchDataLine(line.slice(5).trim(), handlers);
           }
         }
+        // Server closed the stream cleanly — treat like any other drop and reconnect.
+        if (controller.signal.aborted) return;
+        onError(new Error("event stream ended; reconnecting"));
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        onError(err);
       }
-    } catch (err) {
-      if (!controller.signal.aborted) onError(err);
+      const delay = Math.min(SSE_RETRY_MAX_MS, SSE_RETRY_BASE_MS * 2 ** attempt) + Math.random() * 500;
+      attempt++;
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, delay);
+        controller.signal.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(t);
+            resolve();
+          },
+          { once: true },
+        );
+      });
     }
   })();
   return () => controller.abort();

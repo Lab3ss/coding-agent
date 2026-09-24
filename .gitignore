@@ -7,6 +7,8 @@ sessions/
 !.env.example
 bot-state*.json
 usage-*.json
+registry.db
+registry.db-*
 registry-*.db
 registry-*.db-*
 *.log

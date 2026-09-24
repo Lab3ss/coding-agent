@@ -18,7 +18,15 @@
  */
 import { MatrixClient, SimpleFsStorageProvider, AutojoinRoomsMixin } from "matrix-bot-sdk";
 import { getRoom, newRoom, saveRoom, touch, idleRooms, type Room } from "./registry.ts";
-import { provisionRoom, teardownRoom, roomResourceName, roomServerUrl, waitForRunning, getRoomServerPassword } from "./k8s.ts";
+import {
+  provisionRoom,
+  teardownRoom,
+  roomResourceName,
+  roomServerUrl,
+  waitForRunning,
+  readRoomPodState,
+  getRoomServerPassword,
+} from "./k8s.ts";
 import {
   createSession,
   sendMessage,
@@ -27,8 +35,8 @@ import {
   getSessionUsage,
   probeConnection,
   abortSession,
-  type SessionUsage,
 } from "./opencode.ts";
+import { parseRepo, describeError, formatUsage, splitForMatrix } from "./util.ts";
 
 const COST_ALERT_STEP_USD = 5;
 
@@ -47,14 +55,6 @@ const startedAt = Date.now();
 const me = await client.getUserId();
 console.log(`[coding-agent] up as ${me} on ${homeserver}`);
 
-function parseRepo(text: string): string | null {
-  const t = text.trim();
-  const url = t.match(/github\.com[/:]([^/\s]+\/[^/\s]+?)(?:\.git)?\/?$/i);
-  if (url) return url[1];
-  if (/^[\w.-]+\/[\w.-]+$/.test(t)) return t;
-  return null;
-}
-
 // Live-pod-only state, never persisted: the opencode server password (fresh
 // every provision) and the SSE watcher's stop function.
 const serverPasswords = new Map<string, string>(); // roomId -> password
@@ -62,6 +62,14 @@ const permissionWatchers = new Map<string, () => void>(); // roomId -> stop()
 const pendingApprovals = new Map<string, (approved: boolean) => void>(); // roomId -> resolver
 const busyRooms = new Set<string>();
 const lastAlertedCostUsd = new Map<string, number>(); // roomId -> $ already notified up to
+
+// Matrix sync can redeliver events across reconnects; without dedup a single
+// redelivered "run this task" gets answered twice (the second time with
+// "Still working…" noise, or worse, queued as a new turn). Capped so it can't
+// grow without bound; clearing at the cap is fine — duplicates only matter
+// within seconds of each other, and even the smallest cap far exceeds that.
+const seenEventIds = new Set<string>();
+const SEEN_EVENT_IDS_CAP = 2000;
 
 async function startPermissionWatcher(room: Room) {
   if (permissionWatchers.has(room.roomId)) return;
@@ -77,9 +85,13 @@ async function startPermissionWatcher(room: Room) {
         `🔐 Approval needed:\n${permReq.description}\nReply *yes* to allow, anything else to deny. No rush — I'll wait as long as it takes.`,
       );
       const approved = await new Promise<boolean>((resolve) => pendingApprovals.set(room.roomId, resolve));
-      await respondPermission(baseUrl, password, permReq.sessionId, permReq.permissionId, approved).catch((err) =>
-        client.sendText(room.roomId, `⚠️ failed to record approval: ${err?.message ?? err}`),
-      );
+      await respondPermission(baseUrl, password, permReq.sessionId, permReq.permissionId, approved).catch((err) => {
+        // Skip the room-side notice if the pod was torn down while the answer was
+        // pending — otherwise teardown produces a confusing "failed to record
+        // approval" error for an approval that no longer matters.
+        if (!permissionWatchers.has(room.roomId)) return;
+        client.sendText(room.roomId, `⚠️ failed to record approval: ${err?.message ?? err}`).catch(() => {});
+      });
     },
     (progress) => {
       if (progress.sessionId !== room.sessionId) return;
@@ -114,25 +126,26 @@ async function startPermissionWatcher(room: Room) {
       console.log(`[${room.roomId}] 🗜️ context compacted`);
       client.sendText(room.roomId, "🗜️ Context got compacted (older history was trimmed to make room).").catch(() => {});
     },
-    (err) => console.warn(`[${room.roomId}] permission watcher error:`, err?.message ?? err),
+    (err) => console.warn(`[${room.roomId}] permission watcher error:`, describeError(err)),
   );
   permissionWatchers.set(room.roomId, stop);
 }
 
-/** Logs to the broker's own container output and posts the same line to the room. */
+/** Logs to the broker's own container output and posts the same line to the room.
+ * Best-effort: a status line is cosmetic — a homeserver blip must not abort
+ * whatever operation (provisioning, a turn) the line was announcing. */
 async function announce(room: Room, text: string): Promise<void> {
   console.log(`[${room.roomId}] ${text}`);
-  await client.sendText(room.roomId, text);
+  await client.sendText(room.roomId, text).catch((err: any) =>
+    console.warn(`[${room.roomId}] failed to send announcement:`, err?.message ?? err),
+  );
 }
 
-function formatUsage(usage: SessionUsage): string {
-  const cost = typeof usage.cost === "number" ? `$${usage.cost.toFixed(4)}` : "n/a (not reported for this model)";
-  const t = usage.tokens;
-  const tokens = t
-    ? `in: ${t.input} · out: ${t.output} · reasoning: ${t.reasoning} · cache read: ${t.cache.read} · cache write: ${t.cache.write}`
-    : "n/a";
-  const context = usage.compactedAt ? `compacted at ${new Date(usage.compactedAt).toLocaleString()}` : "not compacted";
-  return `📊 Usage for this session\n💰 Cost: ${cost}\n🔢 Tokens — ${tokens}\n🗜️ Context: ${context}`;
+/** Sends possibly-huge opencode output, splitting on line boundaries so no
+ * single event exceeds Matrix's size limit (which would reject the WHOLE reply). */
+async function sendLong(roomId: string, text: string): Promise<void> {
+  const parts = splitForMatrix(text);
+  for (const part of parts) await client.sendText(roomId, part);
 }
 
 /** Live pull, not the cached SSE state — always accurate, and works even before any
@@ -144,20 +157,15 @@ async function sendUsage(room: Room): Promise<void> {
   await client.sendText(room.roomId, formatUsage(usage));
 }
 
-// fetch() wraps the real undici error (e.g. UND_ERR_HEADERS_TIMEOUT, UND_ERR_CONNECT_TIMEOUT)
-// in a generic `TypeError: fetch failed` with the actual cause on `.cause` — logging err.message
-// alone just prints "fetch failed" with no way to tell a timeout from a connect error.
-function describeError(err: any): string {
-  const code = err?.cause?.code ?? err?.code;
-  const message = err?.cause?.message ?? err?.message ?? String(err);
-  return code ? `${message} (code=${code})` : message;
-}
-
 function stopPermissionWatcher(roomId: string) {
   permissionWatchers.get(roomId)?.();
   permissionWatchers.delete(roomId);
   serverPasswords.delete(roomId);
   lastAlertedCostUsd.delete(roomId); // a re-provision starts a fresh $0 opencode session
+  // If an approval was pending when the pod went away, nobody will ever POST
+  // the response — resolve it (denied) so the watcher's await doesn't dangle.
+  pendingApprovals.get(roomId)?.(false);
+  pendingApprovals.delete(roomId);
 }
 
 /**
@@ -165,14 +173,32 @@ function stopPermissionWatcher(roomId: string) {
  * If the pod is already live but the broker restarted since (losing its
  * in-memory serverPasswords/permissionWatchers), recovers the password from
  * the Secret and restarts the watcher rather than assuming they're set.
+ *
+ * Self-heals a stale registry row: if the recorded pod is actually gone or
+ * dead (out-of-band deletion, node reboot, eviction, OOM-kill with
+ * restartPolicy: Never), drops the leftovers and re-provisions — otherwise
+ * every message would retry a black hole forever (the Secret still exists,
+ * so password recovery "succeeds" into nothing).
  */
 async function ensureProvisioned(room: Room): Promise<void> {
   if (room.podName) {
-    if (!serverPasswords.has(room.roomId)) {
-      serverPasswords.set(room.roomId, await getRoomServerPassword(room.podName));
+    const state = await readRoomPodState(room.podName).catch(() => "unknown" as const);
+    if (state === "gone" || state === "failed") {
+      await announce(room, "♻️ previous workspace pod is gone — re-provisioning…");
+      await teardownRoom(room.podName).catch((err) =>
+        console.warn(`[${room.roomId}] stale pod cleanup failed:`, describeError(err)),
+      );
+      room.podName = undefined;
+      room.sessionId = undefined;
+      saveRoom(room);
+      stopPermissionWatcher(room.roomId);
+    } else {
+      if (!serverPasswords.has(room.roomId)) {
+        serverPasswords.set(room.roomId, await getRoomServerPassword(room.podName));
+      }
+      await startPermissionWatcher(room);
+      return;
     }
-    await startPermissionWatcher(room);
-    return;
   }
   const roomName = await client.getRoomStateEvent(room.roomId, "m.room.name", "").then(
     (s) => s?.name as string | undefined,
@@ -225,28 +251,28 @@ async function teardown(room: Room, reason: string) {
 setInterval(async () => {
   for (const room of idleRooms(idleTeardownMs)) {
     console.log(`[${room.roomId}] idle >${(idleTeardownMs / 3600_000).toFixed(1)}h — tearing down`);
-    await teardown(room, "idle").catch((err) => console.warn(`[${room.roomId}] teardown failed:`, err));
+    await teardown(room, "idle").catch((err) => console.warn(`[${room.roomId}] teardown failed:`, err?.message ?? err));
   }
 }, sweepIntervalMs);
 
-client.on("room.message", async (roomId: string, event: any) => {
+async function handleRoomMessage(roomId: string, event: any): Promise<void> {
   if (event.sender === me) return;
   if (!event.content || event.content.msgtype !== "m.text") return;
   if ((event.origin_server_ts ?? 0) < startedAt) return;
 
+  const eventId: string | undefined = event.event_id;
+  if (eventId) {
+    if (seenEventIds.has(eventId)) return;
+    seenEventIds.add(eventId);
+    if (seenEventIds.size > SEEN_EVENT_IDS_CAP) seenEventIds.clear();
+  }
+
   const body: string = (event.content.body ?? "").trim();
   touch(roomId);
 
-  // If this room is waiting on an approval, this message IS the answer.
-  const pending = pendingApprovals.get(roomId);
-  if (pending) {
-    pendingApprovals.delete(roomId);
-    const approved = /^(y|yes|ok|okay|approve|approved|go|sure|👍|✅)\b/i.test(body);
-    await client.sendText(roomId, approved ? "✅ Approved — proceeding." : "🚫 Denied.");
-    pending(approved);
-    return;
-  }
-
+  // Slash commands first: they must work even while an approval is pending
+  // (e.g. /stop during an approval prompt previously got swallowed and
+  // answered the approval with "denied" instead of stopping the pod).
   if (/^\/stop\b/i.test(body)) {
     const room = getRoom(roomId);
     if (!room?.podName) {
@@ -306,6 +332,16 @@ client.on("room.message", async (roomId: string, event: any) => {
     // model is sent per-message (src/opencode.ts), never baked into the pod,
     // so this takes effect on the very next message — no restart needed.
     await client.sendText(roomId, `Model set to ${arg}. Takes effect on your next message.`);
+    return;
+  }
+
+  // If this room is waiting on an approval, this message IS the answer.
+  const pending = pendingApprovals.get(roomId);
+  if (pending) {
+    pendingApprovals.delete(roomId);
+    const approved = /^(y|yes|ok|okay|approve|approved|go|sure|👍|✅)\b/i.test(body);
+    await client.sendText(roomId, approved ? "✅ Approved — proceeding." : "🚫 Denied.");
+    pending(approved);
     return;
   }
 
@@ -394,7 +430,7 @@ client.on("room.message", async (roomId: string, event: any) => {
     await retryUntilReady(() => probeConnection(baseUrl, password));
     sentAt = Date.now();
     const reply = await sendMessage(baseUrl, password, room.sessionId!, body, room.model);
-    await client.sendText(roomId, reply || "(no output)");
+    await sendLong(roomId, reply || "(no output)");
   } catch (err: any) {
     // Only console.log's own line has a timestamp (via `kubectl logs --timestamps`) and
     // survives independently of Matrix — the error text sent to the room can get lost in
@@ -416,6 +452,17 @@ client.on("room.message", async (roomId: string, event: any) => {
   } finally {
     busyRooms.delete(roomId);
   }
+}
+
+client.on("room.message", (roomId: string, event: any) => {
+  // Error boundary: matrix-bot-sdk doesn't await handler promises, so a
+  // rejection escaping this callback is an unhandled rejection — Node's
+  // default for that is to crash the whole process, taking every room down
+  // with one bad message. Catch, log, and keep serving the other rooms.
+  handleRoomMessage(roomId, event).catch((err) => {
+    console.error(`[${roomId}] message handler failed: ${describeError(err)}`);
+    client.sendText(roomId, `⚠️ something went wrong handling that message: ${describeError(err)}`).catch(() => {});
+  });
 });
 
 await client.start();
