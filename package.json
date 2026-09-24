@@ -5,12 +5,25 @@
   "type": "module",
   "description": "Chat-driven autonomous coding agent over Matrix — provisions an isolated opencode-backed pod per room.",
   "main": "src/broker.ts",
+  "engines": {
+    "node": ">=22.18"
+  },
   "scripts": {
-    "broker": "node src/broker.ts"
+    "broker": "node src/broker.ts",
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
   },
   "dependencies": {
     "@kubernetes/client-node": "^2.0.0",
     "matrix-bot-sdk": "^0.8.0",
     "undici": "^8.10.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "typescript": "^5.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "typescript": "5.9"
   }
 }
