@@ -40,11 +40,17 @@ const AppLayer = OrchestratorLive(orchestratorConfig).pipe(
 
 const runtime = ManagedRuntime.make(AppLayer);
 
+// The only failure this effect can produce is the adapter's stable
+// "chat-start-failed" code (raw cause already logged by the adapter) — boot
+// reports the code and exits; there is no broker without a chat transport.
 await runtime.runPromise(
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator;
     yield* orchestrator.start; // hooks the adapter's inbound stream + idle sweep
   }),
-);
+).catch((code: "chat-start-failed") => {
+  console.error(`[coding-agent] startup failed: ${code} (details above)`);
+  process.exit(1);
+});
 
 console.log("[coding-agent] listening. Invite me to a room to onboard a project.");
