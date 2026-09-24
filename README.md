@@ -14,13 +14,21 @@ Two pieces:
   key. When invited to a new room, it asks for a repo, a GitHub PAT scoped to
   that repo, and a model (any OpenRouter model id), then provisions an
   isolated pod for that room via the Kubernetes API (`src/k8s.ts`).
+  Internally it's split: the chat transport (Matrix today) is an adapter
+  (`src/adapter/matrix.ts`) behind a transport-neutral contract
+  (`src/adapter/types.ts`), and the platform-agnostic conversation logic —
+  onboarding, commands, approval gates, provisioning, retries — is the
+  orchestrator (`src/core/orchestrator.ts`, Effect-TS, see `src/core/`).
+  Another chat platform is a new adapter; the core doesn't change.
 - **The runner** (`runner/`) — a minimal, throwaway image. On start it clones
   the room's repo with the room's PAT and runs a headless `opencode serve`.
   No persistent storage: a fresh pod means a fresh clone and a fresh
   `opencode` session. The image bakes in opencode's global config
-  (`runner/opencode.json`) pointing at Matrix-specific agent rules
-  (`runner/opencode-rules.md`) — e.g. plain-text-only replies, since Matrix
-  clients don't render markdown.
+  (`runner/opencode.json`) with default agent rules
+  (`runner/opencode-rules.md`); the chat channel's own formatting rules (e.g.
+  plain-text-only for Matrix, since Matrix clients don't render markdown) are
+  injected per pod by the broker from its adapter's capability profile
+  (`AGENT_RULES`) and replace the baked-in default at startup.
 
 The broker talks to each room's runner over HTTP (`src/opencode.ts`):
 sending prompts, and relaying `opencode`'s own permission/approval prompts
