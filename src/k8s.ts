@@ -68,13 +68,17 @@ export async function getRoomServerPassword(name: string): Promise<string> {
  * and Pod got created but the readiness wait then failed) — already-existing
  * resources are left as-is rather than erroring on "already exists".
  *
+ * `agentRules` (optional) is the chat channel's formatting capability profile
+ * (e.g. Matrix needs plain-text-only agent output); the runner applies it in
+ * place of its baked-in default rules.
+ *
  * Returns the room's actual OPENCODE_SERVER_PASSWORD, read back from the
  * Secret rather than trusting a freshly-generated one — if the Secret
  * already existed (idempotent create skipped it), the running pod still has
  * whatever password was baked in on its FIRST creation, so generating a new
  * one here and using that for auth would silently mismatch (401).
  */
-export async function provisionRoom(name: string, env: RoomEnv): Promise<string> {
+export async function provisionRoom(name: string, env: RoomEnv, agentRules?: string): Promise<string> {
   await ignoringConflict(() =>
     coreApi().createNamespacedSecret({
       namespace: ROOMS_NS,
@@ -85,6 +89,7 @@ export async function provisionRoom(name: string, env: RoomEnv): Promise<string>
           GH_TOKEN: env.token,
           OPENCODE_SERVER_PASSWORD: crypto.randomBytes(16).toString("hex"),
           OPENROUTER_API_KEY: env.openrouterKey,
+          ...(agentRules ? { AGENT_RULES: agentRules } : {}),
         },
       },
     }),
