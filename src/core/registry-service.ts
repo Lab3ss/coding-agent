@@ -4,7 +4,7 @@
  * which. Method bodies are sync (node:sqlite) and never fail at the type level.
  */
 import { Context, Layer } from "effect";
-import { getRoom, idleRooms, newRoom, saveRoom, touch, type Room } from "../registry.ts";
+import { deleteRoom, getRoom, idleRooms, newRoom, saveRoom, touch, type Room } from "../registry.ts";
 
 export type { Room };
 
@@ -15,6 +15,8 @@ export interface RegistryService {
   readonly touch: (conversationId: string) => void;
   /** Rooms with a live pod idle longer than maxIdleMs. */
   readonly idle: (maxIdleMs: number) => Room[];
+  /** Purges a conversation entirely — see registry.ts's deleteRoom for when this is safe. */
+  readonly delete: (conversationId: string) => void;
 }
 
 export class Registry extends Context.Tag("coding-agent/Registry")<Registry, RegistryService>() {}
@@ -25,4 +27,5 @@ export const RegistryLive = Layer.sync(Registry, () => ({
   save: saveRoom,
   touch,
   idle: idleRooms,
+  delete: deleteRoom,
 }));

@@ -49,6 +49,7 @@ const fakeRegistry: RegistryService = {
   save: (r) => rooms.set(r.roomId, r),
   touch: () => {},
   idle: () => [],
+  delete: (id) => rooms.delete(id),
 };
 
 // Failure toggles — flip these to drive the typed error paths end-to-end.
@@ -223,6 +224,25 @@ test("/stop works while an approval is pending and resolves it without POSTing",
   const td = recorded.find((r) => r.event.type === "teardown");
   assert.ok(td);
   assert.equal(td.event.type === "teardown" && td.event.reason, "requested");
+});
+
+test("abandoned conversation tears down the pod and purges the registry row", async () => {
+  reset();
+  await onboard("!t5b");
+  assert.ok(rooms.has("!t5b"));
+
+  await Effect.runPromise(orchestrator.abandon("!t5b"));
+  assert.ok(!rooms.has("!t5b"));
+  assert.equal(calls.teardown.length, 1);
+  assert.equal(calls.teardown[0], "room-test-t5b");
+  // No outbound event for this one — nobody is left in the conversation to read it.
+  assert.equal(recorded.filter((r) => r.conversationId === "!t5b").at(-1)?.event.type, "info");
+});
+
+test("abandoning a conversation that never onboarded is a no-op", async () => {
+  reset();
+  await Effect.runPromise(orchestrator.abandon("!never-seen"));
+  assert.equal(calls.teardown.length, 0);
 });
 
 test("/model updates per-message routing without touching the pod", async () => {

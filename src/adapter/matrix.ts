@@ -178,7 +178,10 @@ const makeMatrixAdapter = (config: MatrixAdapterConfig): Effect.Effect<ChatAdapt
         Effect.catchAll(() => Effect.succeed(undefined)),
       );
 
-    const start = (onInbound: (msg: InboundMessage) => void): Effect.Effect<void, "chat-start-failed"> =>
+    const start = (
+      onInbound: (msg: InboundMessage) => void,
+      onAbandoned: (conversationId: string) => void,
+    ): Effect.Effect<void, "chat-start-failed"> =>
       Effect.gen(function* () {
         client.on("room.message", (roomId: string, event: any) => {
           if (event.sender === me) return;
@@ -196,6 +199,19 @@ const makeMatrixAdapter = (config: MatrixAdapterConfig): Effect.Effect<ChatAdapt
             senderId: event.sender,
             text: (event.content.body ?? "").trim(),
           });
+        });
+        // room.leave only fires for the bot's own membership (matrix-bot-sdk quirk) — anyone
+        // else leaving/getting banned only shows up on the generic room.event firehose, so
+        // that's what we filter here to notice "was someone else's membership just revoked".
+        client.on("room.event", (roomId: string, event: any) => {
+          if (event.type !== "m.room.member" || event.state_key === me) return;
+          if (event.content?.membership !== "leave" && event.content?.membership !== "ban") return;
+          void client
+            .getJoinedRoomMembers(roomId)
+            .then((members: string[]) => {
+              if (members.every((id) => id === me)) onAbandoned(roomId);
+            })
+            .catch((err) => console.warn(`[${roomId}] failed to check room membership:`, describeError(err)));
         });
         yield* Effect.tryPromise({
           try: () => client.start(),

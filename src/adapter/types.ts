@@ -61,8 +61,14 @@ export interface ChatAdapterService {
   /** Registers the inbound handler and starts the transport. Resolves once the
    * transport is up; the transport itself keeps running in the background.
    * Error channel: a stable code, not an exception — the entry point logs the
-   * raw cause and exits. */
-  readonly start: (onInbound: (msg: InboundMessage) => void) => Effect.Effect<void, "chat-start-failed">;
+   * raw cause and exits.
+   * `onAbandoned` fires when every other participant has left a conversation —
+   * platform-specific membership semantics stay inside the adapter; the core
+   * just gets told "nobody can ever come back to this one". */
+  readonly start: (
+    onInbound: (msg: InboundMessage) => void,
+    onAbandoned: (conversationId: ConversationId) => void,
+  ) => Effect.Effect<void, "chat-start-failed">;
   /** Renders and delivers one event. Must never fail (logs internally) — chat
    * delivery is best-effort and must not abort whatever the core is doing. */
   readonly send: (conversationId: ConversationId, event: OutboundEvent) => Effect.Effect<void>;

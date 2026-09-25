@@ -75,6 +75,15 @@ export function saveRoom(r: Room) {
   persist(r);
 }
 
+/** Purges a room entirely — repo/token/model included. Only meaningful when nobody can ever
+ * come back to it (e.g. every human left the conversation): unlike a normal teardown, this
+ * throws away the "next message re-provisions without re-asking" convenience on purpose, so a
+ * lingering GitHub PAT doesn't sit in the database indefinitely for an abandoned room. */
+export function deleteRoom(roomId: string): void {
+  rooms.delete(roomId);
+  db.prepare(`DELETE FROM rooms WHERE room_id = ?`).run(roomId);
+}
+
 export function touch(roomId: string) {
   const r = rooms.get(roomId);
   if (r) {

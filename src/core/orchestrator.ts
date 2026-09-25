@@ -37,6 +37,10 @@ export interface OrchestratorService {
   /** Handles one inbound user message. Error channel is `never`: every path
    * either succeeds or turns its typed code into a room-visible error event. */
   readonly handleInbound: (msg: InboundMessage) => Effect.Effect<void>;
+  /** Nobody but the bot is left in a conversation — purges its workspace and registry row
+   * entirely. Exposed alongside handleInbound so any adapter's membership mechanism (or a
+   * future non-chat trigger) can reach it without going through `start`. */
+  readonly abandon: (conversationId: string) => Effect.Effect<void>;
   /** Starts background loops (idle sweep) and hooks the chat adapter's inbound
    * stream into handleInbound. Forks and returns immediately. Fails with a
    * stable code if the transport can't come up — boot should crash on it. */
@@ -227,6 +231,23 @@ const make = (config: OrchestratorConfig) =>
         }
         teardownFields(room);
         yield* send(room.roomId, { type: "teardown", reason, repo: room.repo ?? "" });
+      });
+
+    /** Nobody but the bot is left in the conversation — unlike `teardown`, purges the registry
+     * row entirely (see registry.ts's deleteRoom) rather than just clearing pod fields: no
+     * human can ever send a message here again, so there's no "remember for next time" to
+     * preserve, and a lingering GitHub PAT shouldn't outlive every participant who could use it.
+     * No outbound event — nobody left to read it. */
+    const abandon = (conversationId: string): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        const room = registry.get(conversationId);
+        if (!room) return; // never onboarded — nothing to clean up
+        console.log(`[${conversationId}] abandoned (bot alone in conversation) — tearing down`);
+        stopWatcher(conversationId);
+        if (room.podName) {
+          yield* workspace.teardown(room.podName).pipe(Effect.catchAll(() => Effect.void));
+        }
+        registry.delete(conversationId);
       });
 
     /** Live usage pull, not the cached SSE state — always accurate, and works even
@@ -485,14 +506,21 @@ const make = (config: OrchestratorConfig) =>
         // closure over concrete services (no Effect context), so it runs via
         // plain runPromise here — no runtime plumbing needed. The catch is
         // belt-and-suspenders: handleInbound's own boundary is total.
-        yield* adapter.start((msg) => {
-          void Effect.runPromise(handleInbound(msg)).catch((err) =>
-            console.error(`[${msg.conversationId}] orchestrator failure:`, describeError(err)),
-          );
-        });
+        yield* adapter.start(
+          (msg) => {
+            void Effect.runPromise(handleInbound(msg)).catch((err) =>
+              console.error(`[${msg.conversationId}] orchestrator failure:`, describeError(err)),
+            );
+          },
+          (conversationId) => {
+            void Effect.runPromise(abandon(conversationId)).catch((err) =>
+              console.error(`[${conversationId}] abandon failure:`, describeError(err)),
+            );
+          },
+        );
       });
 
-    return { handleInbound, start } satisfies OrchestratorService;
+    return { handleInbound, abandon, start } satisfies OrchestratorService;
   });
 
 export const OrchestratorLive = (config: OrchestratorConfig) => Layer.effect(Orchestrator, make(config));
