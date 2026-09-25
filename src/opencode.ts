@@ -83,12 +83,16 @@ export async function sendMessage(
   // user-supplied model (e.g. "google/gemini-3.8-flash:batch") is the modelID
   // OpenRouter itself expects.
   if (model) body.model = { providerID: "openrouter", modelID: model };
-  const res = await req<{ parts: Array<{ type: string; text?: string }> }>(
-    baseUrl,
-    password,
-    `/session/${sessionId}/message`,
-    { method: "POST", body: JSON.stringify(body) },
-  );
+  const res = await req<{
+    info: { error?: { name: string; data?: { message?: string } } };
+    parts: Array<{ type: string; text?: string }>;
+  }>(baseUrl, password, `/session/${sessionId}/message`, { method: "POST", body: JSON.stringify(body) });
+  // A rejected turn (e.g. context too large for the model) comes back as a normal 200 with
+  // an empty `parts` and the real failure on `info.error` — silently treating that as "no
+  // output" hides an actionable error behind a blank reply.
+  if (res.info.error) {
+    throw new Error(`opencode turn failed: ${res.info.error.data?.message ?? res.info.error.name}`);
+  }
   return res.parts
     .filter((p) => p.type === "text" && p.text)
     .map((p) => p.text)
