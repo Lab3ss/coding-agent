@@ -22,6 +22,22 @@ you review from GitHub mobile. **One room = one project.**
   prompts of their own. No seats, no shared dashboards.
 - **Multi-project** — one room per project, all served by a single broker.
 
+## Why these building blocks
+
+Each piece is replaceable, not a lock-in — that's the point:
+
+- **Matrix** — open, federated, self-hostable protocol with solid mobile
+  clients, so the "messenger as IDE" experience works on infrastructure you
+  control. The transport is an adapter behind a neutral contract: Slack,
+  Telegram or Discord are new adapters, the core doesn't change.
+- **opencode** — open-source, model-agnostic coding agent with a headless
+  server mode and built-in permission gates. The broker just relays prompts
+  and approvals over HTTP; any agent exposing a similar API could take its
+  place.
+- **OpenRouter** — one API key for hundreds of models, with per-model usage
+  and cost reporting. Swap models mid-session (`/model`) without touching the
+  pod — no vendor decides which model you run.
+
 ## How it works
 
 Two pieces:
