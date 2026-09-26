@@ -72,7 +72,7 @@ sending prompts, and relaying `opencode`'s own permission/approval prompts
 | `MATRIX_HOMESERVER`, `MATRIX_TOKEN` | the bot's Matrix account |
 | `OPENROUTER_API_KEY` | the only LLM credential — copied into every room's pod at provision time |
 | `ROOMS_NAMESPACE` | where per-room pods live; default `coding-agent-rooms` |
-| `RUNNER_IMAGE` | the runner image tag to provision; default `ghcr.io/lab3ss/coding-agent-runner:0.2.0` |
+| `RUNNER_IMAGE` | the runner image tag to provision; default `ghcr.io/lab3ss/coding-agent-runner:0.2.1` |
 | `IDLE_TEARDOWN_HOURS` | idle threshold before auto-teardown; default `24` |
 
 ## Safety

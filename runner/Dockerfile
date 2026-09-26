@@ -24,8 +24,10 @@ RUN chmod +x /entrypoint.sh && chown node:node /entrypoint.sh
 # replies only, since Matrix clients don't render markdown).
 COPY opencode.json /home/node/.config/opencode/opencode.json
 COPY opencode-rules.md /home/node/.config/opencode/opencode-rules.md
-RUN chown node:node /home/node/.config/opencode/opencode.json \
-                     /home/node/.config/opencode/opencode-rules.md
+# chown the directory itself, not just these two files: entrypoint.sh writes a
+# new channel-rules.md into it at runtime as `node`, which needs dir write
+# permission, not just file ownership.
+RUN chown -R node:node /home/node/.config/opencode
 
 USER node
 WORKDIR /home/node
