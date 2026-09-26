@@ -17,6 +17,9 @@ you review from GitHub mobile. **One room = one project.**
 - **Sovereignty** — any OpenRouter model, switchable mid-session
   (`/model`), usage tracking (`/usage`), self-hosted on your own cluster.
   No closed SaaS, no vendor pricing, no locked-in models.
+- **Collaboration built-in** — the session lives in a chat room: invite a
+  colleague and they see everything the agent does, and can chime in with
+  prompts of their own. No seats, no shared dashboards.
 - **Multi-project** — one room per project, all served by a single broker.
 
 ## How it works
