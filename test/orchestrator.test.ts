@@ -4,7 +4,7 @@ import { Effect, Layer, ManagedRuntime } from "effect";
 import { ChatAdapter, type ChatAdapterService, type InboundMessage, type OutboundEvent } from "../src/adapter/types.ts";
 import { Orchestrator, OrchestratorLive } from "../src/core/orchestrator.ts";
 import { Registry, type RegistryService, type Room } from "../src/core/registry-service.ts";
-import { Workspace, type WatchHandlers, type WorkspaceService } from "../src/core/workspace.ts";
+import { Workspace, type Failure, type WatchHandlers, type WorkspaceService } from "../src/core/workspace.ts";
 
 // ---------------------------------------------------------------------------
 // Fakes — the whole point of the adapter seam: onboarding, commands, and the
@@ -54,9 +54,9 @@ const fakeRegistry: RegistryService = {
 
 // Failure toggles — flip these to drive the typed error paths end-to-end.
 const failures = {
-  provision: false as "provision-failed" | false,
-  sendMessage: null as "message-send-failed" | null,
-  usage: false as "usage-fetch-failed" | false,
+  provision: false as Failure<"provision-failed"> | false,
+  sendMessage: null as Failure<"message-send-failed"> | null,
+  usage: false as Failure<"usage-fetch-failed"> | false,
 };
 
 const fakeWorkspace: WorkspaceService = {
@@ -265,30 +265,30 @@ test("onboarding provision failure surfaces the typed code in the room", async (
   reset();
   await run({ conversationId: "!t8", text: "lab3ss/coding-agent" });
   await run({ conversationId: "!t8", text: "ghp_token1234567", messageId: "$m1" });
-  failures.provision = "provision-failed";
+  failures.provision = { code: "provision-failed", details: "boom" };
   await run({ conversationId: "!t8", text: "anthropic/claude-sonnet-4.5" });
   const err = recorded.find((r) => r.event.type === "error");
   assert.ok(err);
-  assert.equal(err.event.type === "error" && err.event.text, "setup failed: provision-failed (details in broker logs)");
+  assert.equal(err.event.type === "error" && err.event.text, "setup failed: provision-failed — boom");
 });
 
 test("task failure surfaces the typed code and aborts the server-side turn", async () => {
   reset();
   await onboard("!t9");
-  failures.sendMessage = "message-send-failed";
+  failures.sendMessage = { code: "message-send-failed", details: "boom" };
   await run({ conversationId: "!t9", text: "fix the login bug" });
   assert.equal(calls.aborted, 1); // turn aborted so it can't queue future messages
   const err = recorded.find((r) => r.event.type === "error");
   assert.ok(err);
-  assert.equal(err.event.type === "error" && err.event.text, "task failed: message-send-failed (details in broker logs)");
+  assert.equal(err.event.type === "error" && err.event.text, "task failed: message-send-failed — boom");
 });
 
 test("/usage failure surfaces the typed code", async () => {
   reset();
   await onboard("!t10");
-  failures.usage = "usage-fetch-failed";
+  failures.usage = { code: "usage-fetch-failed", details: "boom" };
   await run({ conversationId: "!t10", text: "/usage" });
   const err = recorded.find((r) => r.event.type === "error");
   assert.ok(err);
-  assert.equal(err.event.type === "error" && err.event.text, "couldn't fetch usage: usage-fetch-failed (details in broker logs)");
+  assert.equal(err.event.type === "error" && err.event.text, "couldn't fetch usage: usage-fetch-failed — boom");
 });

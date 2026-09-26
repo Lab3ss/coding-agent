@@ -4,11 +4,12 @@
  * (src/k8s.ts, src/opencode.ts) at this seam — everything below stays plain
  * TypeScript; everything above (orchestrator) speaks Effect.
  *
- * Error discipline: every method's error channel is a string-literal union —
- * one stable code per failure mode, so callers switch on exact causes. The
- * raw cause (HTTP status, errno, stack) is logged at this seam once and
- * never travels further; downstream code and the room only ever see the
- * identified code. Nothing throws across this boundary.
+ * Error discipline: every method's error channel is a `Failure<Code>` — a
+ * stable literal `code` per failure mode (so callers still switch on exact
+ * causes) paired with `details`, the raw cause's message, so a chat room can
+ * show what actually happened. The raw cause itself (HTTP status, errno,
+ * stack) is logged in full at this seam once; only its message travels
+ * further. Nothing throws across this boundary.
  *
  * The LLM credential (OPENROUTER_API_KEY) is infra-side: the orchestrator
  * never sees it, it's injected here at wiring time and copied into each
@@ -38,6 +39,11 @@ export type WorkspaceError =
   | "permission-respond-failed" // POSTing an approval decision failed
   | "watch-failed"; // SSE event stream couldn't be opened
 
+/** A workspace failure: the stable `code` (for callers to switch on) plus
+ * `details` — the raw cause's message, safe to surface since only this
+ * broker's own operator talks to it right now. */
+export type Failure<Code extends WorkspaceError = WorkspaceError> = { readonly code: Code; readonly details: string };
+
 /** Callbacks out of the room's SSE event stream (runs outside Effect land). */
 export type WatchHandlers = {
   onPermission: (req: opencode.PermissionRequest) => void;
@@ -58,43 +64,43 @@ export interface WorkspaceService {
     resourceName: string,
     project: { repo: string; token: string },
     agentRules?: string,
-  ) => Effect.Effect<string, "provision-failed" | "secret-read-failed">;
-  readonly waitForRunning: (resourceName: string) => Effect.Effect<void, "pod-wait-failed">;
-  readonly readPodState: (resourceName: string) => Effect.Effect<k8s.RoomPodState, "pod-read-failed">;
-  readonly teardown: (resourceName: string) => Effect.Effect<void, "teardown-failed">;
+  ) => Effect.Effect<string, Failure<"provision-failed" | "secret-read-failed">>;
+  readonly waitForRunning: (resourceName: string) => Effect.Effect<void, Failure<"pod-wait-failed">>;
+  readonly readPodState: (resourceName: string) => Effect.Effect<k8s.RoomPodState, Failure<"pod-read-failed">>;
+  readonly teardown: (resourceName: string) => Effect.Effect<void, Failure<"teardown-failed">>;
   /** Reads the room's opencode server password from its live Secret. */
-  readonly serverPassword: (resourceName: string) => Effect.Effect<string, "secret-read-failed">;
+  readonly serverPassword: (resourceName: string) => Effect.Effect<string, Failure<"secret-read-failed">>;
   /** Creates the opencode session, retrying until the HTTP server is listening. */
-  readonly createSession: (baseUrl: string, password: string) => Effect.Effect<string, "session-create-failed">;
+  readonly createSession: (baseUrl: string, password: string) => Effect.Effect<string, Failure<"session-create-failed">>;
   /** Bounded connectivity probe, retried — fails fast on a wedged connection. */
-  readonly probe: (baseUrl: string, password: string) => Effect.Effect<void, "probe-failed">;
+  readonly probe: (baseUrl: string, password: string) => Effect.Effect<void, Failure<"probe-failed">>;
   readonly sendMessage: (
     baseUrl: string,
     password: string,
     sessionId: string,
     text: string,
     model?: string,
-  ) => Effect.Effect<string, "message-send-failed">;
+  ) => Effect.Effect<string, Failure<"message-send-failed">>;
   /** Stops a turn that the core gave up on, so it can't queue future ones. */
-  readonly abort: (baseUrl: string, password: string, sessionId: string) => Effect.Effect<void, "session-abort-failed">;
+  readonly abort: (baseUrl: string, password: string, sessionId: string) => Effect.Effect<void, Failure<"session-abort-failed">>;
   readonly usage: (
     baseUrl: string,
     password: string,
     sessionId: string,
-  ) => Effect.Effect<opencode.SessionUsage, "usage-fetch-failed">;
+  ) => Effect.Effect<opencode.SessionUsage, Failure<"usage-fetch-failed">>;
   readonly respondPermission: (
     baseUrl: string,
     password: string,
     sessionId: string,
     permissionId: string,
     approved: boolean,
-  ) => Effect.Effect<void, "permission-respond-failed">;
+  ) => Effect.Effect<void, Failure<"permission-respond-failed">>;
   /** Opens the SSE stream; resolves to a stop function. Handlers run detached. */
   readonly watch: (
     baseUrl: string,
     password: string,
     handlers: WatchHandlers,
-  ) => Effect.Effect<() => void, "watch-failed">;
+  ) => Effect.Effect<() => void, Failure<"watch-failed">>;
 }
 
 export class Workspace extends Context.Tag("coding-agent/Workspace")<Workspace, WorkspaceService>() {}
@@ -121,15 +127,16 @@ function retryUntilReady<T>(fn: () => Promise<T>, attempts = 10, delayMs = 2000)
   })();
 }
 
-/** Wraps a promise call into an Effect whose failure is exactly `code`. The
- * raw cause is logged here — once, with full detail (code, message, cause
- * chain) — so the string union stays diagnosable without carrying payloads. */
-const failing = <A, E extends WorkspaceError>(code: E, run: () => Promise<A>): Effect.Effect<A, E> =>
+/** Wraps a promise call into an Effect whose failure is `{ code, details }`.
+ * The raw cause is logged here in full once; `details` (its message) rides
+ * along in the failure so it can reach the chat room too. */
+const failing = <A, E extends WorkspaceError>(code: E, run: () => Promise<A>): Effect.Effect<A, Failure<E>> =>
   Effect.tryPromise({
     try: run,
     catch: (cause) => {
-      console.error(`[workspace] ${code}: ${describeError(cause)}`);
-      return code;
+      const details = describeError(cause);
+      console.error(`[workspace] ${code}: ${details}`);
+      return { code, details };
     },
   });
 
