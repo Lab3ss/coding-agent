@@ -9,7 +9,7 @@ import * as crypto from "node:crypto";
 import * as k8s from "@kubernetes/client-node";
 
 const ROOMS_NS = process.env.ROOMS_NAMESPACE ?? "coding-agent-rooms";
-const RUNNER_IMAGE = process.env.RUNNER_IMAGE ?? "ghcr.io/lab3ss/coding-agent-runner:0.1.0";
+const RUNNER_IMAGE = process.env.RUNNER_IMAGE ?? "ghcr.io/lab3ss/coding-agent-runner:0.2.0";
 const OPENCODE_PORT = 4096;
 
 // Created lazily on first API use rather than at import time: loadFromDefault
